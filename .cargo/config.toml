@@ -1,0 +1,12 @@
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+    "-C", "link-arg=-target",
+    "-C", "link-arg=arm64-apple-darwin",
+    "-C", "link-arg=-isysroot",
+    "-C", "link-arg=/home/ricepies/fun/sdk/MacOSX14.0.sdk",
+]
+
+[env]
+SDKROOT = "/home/ricepies/fun/sdk/MacOSX14.0.sdk"
