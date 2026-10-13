@@ -153,9 +153,19 @@ pub struct NeteaseCrypt {
     dump_filepath: Option<PathBuf>,
     format: NcmFormat,
     image_data: Vec<u8>,
-    key_box: [u8; 256],
+    mask_table: [u8; 256],
     metadata: Option<NeteaseMusicMetadata>,
     audio_offset: u64,
+}
+
+pub fn compute_mask_table(key_box: &[u8; 256]) -> [u8; 256] {
+    let mut mask = [0u8; 256];
+    for m in 0..256 {
+        let j = ((m + 1) & 0xff) as usize;
+        let k = (key_box[j] as usize + key_box[(key_box[j] as usize + j) & 0xff] as usize) & 0xff;
+        mask[m] = key_box[k];
+    }
+    mask
 }
 
 impl NeteaseCrypt {
@@ -189,6 +199,7 @@ impl NeteaseCrypt {
             return Err("Broken NCM file (invalid key data)".into());
         }
         let key_box = build_key_box(&decrypted_key[17..]);
+        let mask_table = compute_mask_table(&key_box);
 
         file.read_exact(&mut buf4)?;
         let meta_len = u32::from_le_bytes(buf4) as usize;
@@ -251,7 +262,7 @@ impl NeteaseCrypt {
             dump_filepath: None,
             format: NcmFormat::Mp3,
             image_data,
-            key_box,
+            mask_table,
             metadata,
             audio_offset,
         })
@@ -267,6 +278,18 @@ impl NeteaseCrypt {
 
     pub fn metadata(&self) -> Option<&NeteaseMusicMetadata> {
         self.metadata.as_ref()
+    }
+
+    pub fn image_data(&self) -> &[u8] {
+        &self.image_data
+    }
+
+    pub fn format(&self) -> NcmFormat {
+        self.format
+    }
+
+    pub fn image_mime(&self) -> &'static str {
+        mime_type(&self.image_data)
     }
 
     pub fn dump<P: AsRef<Path>>(
@@ -286,11 +309,11 @@ impl NeteaseCrypt {
             None => self.filepath.clone(),
         };
 
-        let mut file = File::open(&self.filepath)?;
+        let mut file = std::io::BufReader::with_capacity(128 * 1024, File::open(&self.filepath)?);
         file.seek(SeekFrom::Start(self.audio_offset))?;
 
-        let mut buffer = [0u8; 0x8000];
-        let mut out_file: Option<File> = None;
+        let mut buffer = [0u8; 0x10000]; // 64 KB buffer (multiple of 256)
+        let mut out_file: Option<std::io::BufWriter<File>> = None;
 
         loop {
             let n = file.read(&mut buffer)?;
@@ -298,12 +321,11 @@ impl NeteaseCrypt {
                 break;
             }
 
-            for i in 0..n {
-                let j = ((i + 1) & 0xff) as usize;
-                let k = (self.key_box[j] as usize
-                    + self.key_box[(self.key_box[j] as usize + j) & 0xff] as usize)
-                    & 0xff;
-                buffer[i] ^= self.key_box[k];
+            // High-speed vectorized XOR using the precomputed 256-byte mask table
+            for chunk in buffer[..n].chunks_mut(256) {
+                for (b, &m) in chunk.iter_mut().zip(&self.mask_table) {
+                    *b ^= m;
+                }
             }
 
             if out_file.is_none() {
@@ -319,7 +341,7 @@ impl NeteaseCrypt {
                         std::fs::create_dir_all(parent)?;
                     }
                 }
-                out_file = Some(File::create(&out_path)?);
+                out_file = Some(std::io::BufWriter::with_capacity(128 * 1024, File::create(&out_path)?));
             }
 
             if let Some(ref mut out) = out_file {
