@@ -216,10 +216,6 @@ impl NeteaseCrypt {
         file.read_exact(&mut buf4)?;
         let meta_len = u32::from_le_bytes(buf4) as usize;
         let metadata = if meta_len == 0 {
-            eprintln!(
-                "\x1b[1m\x1b[33m[Warn] \x1b[0m'{}' missing metadata infomation can't fix some infomation!",
-                path.display()
-            );
             None
         } else {
             if meta_len < 22 {
@@ -256,10 +252,6 @@ impl NeteaseCrypt {
             file.read_exact(&mut img)?;
             img
         } else {
-            eprintln!(
-                "\x1b[1m\x1b[33m[Warn] \x1b[0m'{}' missing album can't fix album image!",
-                path.display()
-            );
             Vec::new()
         };
 

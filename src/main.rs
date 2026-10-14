@@ -24,6 +24,7 @@ A fast, memory-safe standalone tool to convert NetEase Cloud Music (.ncm) files.
   -j, --threads <NUM>      Number of parallel conversion threads (default: CPU cores)
       --meta <DIR>         Custom meta folder path containing track-<id>.jpg artwork
       --prefer-meta-cover  Prefer external meta/ cover over embedded .ncm cover
+      --save-lrc           Also save an independent .lrc sidecar file (by default, lyrics are fused directly into FLAC/MP3)
       --no-lrc             Do not search for or embed .lrc lyrics
       --no-overwrite       Skip conversion if output file already exists
 
@@ -166,6 +167,7 @@ fn process_file(
     no_overwrite: bool,
     prefer_meta_cover: bool,
     no_lrc: bool,
+    save_lrc: bool,
     stats: &Stats,
     output_lock: &Mutex<()>,
 ) {
@@ -221,6 +223,8 @@ fn process_file(
             let cover_note = if let Some(ref p) = resolved_cover {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("meta");
                 format!(" \x1b[2;36m[cover: {name}]\x1b[0m")
+            } else if crypt.image_data().is_empty() {
+                " \x1b[2;33m[no cover]\x1b[0m".to_string()
             } else {
                 String::new()
             };
@@ -242,10 +246,12 @@ fn process_file(
                         );
                     }
 
-                    // Also export the clean, fused standard .lrc file alongside the dumped audio
-                    if let Some(lrc_text) = crypt.lyrics() {
-                        let out_lrc_path = dump_path.with_extension("lrc");
-                        let _ = std::fs::write(&out_lrc_path, lrc_text);
+                    // Only export independent .lrc sidecar file if explicitly requested
+                    if save_lrc {
+                        if let Some(lrc_text) = crypt.lyrics() {
+                            let out_lrc_path = dump_path.with_extension("lrc");
+                            let _ = std::fs::write(&out_lrc_path, lrc_text);
+                        }
                     }
 
                     let mut removed_note = String::new();
@@ -256,7 +262,7 @@ fn process_file(
                         }
                         if let Some(ref src_lrc) = resolved_lrc {
                             let out_lrc_path = dump_path.with_extension("lrc");
-                            if src_lrc != &out_lrc_path && src_lrc.exists() {
+                            if (!save_lrc || src_lrc != &out_lrc_path) && src_lrc.exists() {
                                 let _ = std::fs::remove_file(src_lrc);
                             }
                         }
@@ -321,6 +327,7 @@ fn main() {
     let mut no_overwrite = false;
     let mut prefer_meta_cover = false;
     let mut no_lrc = false;
+    let mut save_lrc = false;
     let mut custom_meta: Option<String> = None;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -346,6 +353,8 @@ fn main() {
             no_overwrite = true;
         } else if arg == "--prefer-meta-cover" {
             prefer_meta_cover = true;
+        } else if arg == "--save-lrc" {
+            save_lrc = true;
         } else if arg == "--no-lrc" {
             no_lrc = true;
         } else if arg == "--meta" {
@@ -546,6 +555,7 @@ fn main() {
                 no_overwrite,
                 prefer_meta_cover,
                 no_lrc,
+                save_lrc,
                 &stats,
                 &output_lock,
             );
@@ -573,6 +583,7 @@ fn main() {
                         no_overwrite,
                         prefer_meta_cover,
                         no_lrc,
+                        save_lrc,
                         stats_ref,
                         lock_ref,
                     );
