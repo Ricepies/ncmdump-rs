@@ -1,1 +1,6 @@
 /target
+*.lrc
+*.flac
+*.mp3
+*.ncm
+

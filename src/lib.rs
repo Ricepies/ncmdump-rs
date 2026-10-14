@@ -468,6 +468,7 @@ impl NeteaseCrypt {
                     let comments = tag.vorbis_comments_mut();
                     comments.set("LYRICS", vec![lrc.clone()]);
                     comments.set("UNSYNCEDLYRICS", vec![lrc.clone()]);
+                    comments.set("SYNCEDLYRICS", vec![lrc.clone()]);
                 }
                 tag.save()?;
             }
@@ -479,6 +480,19 @@ impl NeteaseCrypt {
 /// Fuses NetEase hybrid JSON lines (`{"t": 0, "c": [{"tx": "..."}]}`) and standard LRC lines
 /// into unified standard LRC format `[mm:ss.xxx] text`.
 pub fn parse_and_fuse_lrc(content: &str) -> String {
+    let content_trimmed = content.trim().trim_start_matches('\u{feff}');
+    // Check if the entire file is a NetEase JSON response (e.g. {"lrc": {"lyric": "..."}})
+    if content_trimmed.starts_with('{') && content_trimmed.ends_with('}') {
+        if let Ok(root) = serde_json::from_str::<serde_json::Value>(content_trimmed) {
+            if let Some(lyric_str) = root.get("lrc").and_then(|l| l.get("lyric")).and_then(|s| s.as_str()) {
+                return parse_and_fuse_lrc(lyric_str);
+            }
+            if let Some(lyric_str) = root.get("lyric").and_then(|s| s.as_str()) {
+                return parse_and_fuse_lrc(lyric_str);
+            }
+        }
+    }
+
     let mut out_lines = Vec::new();
     for raw_line in content.lines() {
         let trimmed = raw_line.trim().trim_start_matches('\u{feff}');
@@ -491,10 +505,14 @@ pub fn parse_and_fuse_lrc(content: &str) -> String {
                     let mut text = String::new();
                     if let Some(c) = v.get("c").and_then(|c| c.as_array()) {
                         for item in c {
-                            if let Some(tx) = item.get("tx").and_then(|x| x.as_str()) {
+                            if let Some(tx) = item.get("tx").or_else(|| item.get("text")).and_then(|x| x.as_str()) {
                                 text.push_str(tx);
+                            } else if let Some(s) = item.as_str() {
+                                text.push_str(s);
                             }
                         }
+                    } else if let Some(s) = v.get("c").or_else(|| v.get("text")).or_else(|| v.get("tx")).or_else(|| v.get("lyric")).and_then(|x| x.as_str()) {
+                        text.push_str(s);
                     }
                     if text.is_empty() {
                         out_lines.push(format!("[{mins:02}:{secs:02}.{ms:03}]"));
@@ -835,6 +853,7 @@ pub fn update_flac_tags(
         let comments = tag.vorbis_comments_mut();
         comments.set("LYRICS", vec![lrc.to_string()]);
         comments.set("UNSYNCEDLYRICS", vec![lrc.to_string()]);
+        comments.set("SYNCEDLYRICS", vec![lrc.to_string()]);
         changed = true;
     }
 

@@ -28,8 +28,7 @@ A fast, memory-safe standalone tool to convert NetEase Cloud Music (.ncm) files.
   -j, --threads <NUM>      Number of parallel conversion threads (default: CPU cores)
       --meta <DIR>         Custom meta folder path containing track-<id>.jpg artwork
       --prefer-meta-cover  Prefer external meta/ cover over embedded .ncm cover
-      --save-lrc           Also save an independent .lrc sidecar file (by default, lyrics are fused directly into FLAC/MP3)
-      --no-lrc             Do not search for or embed .lrc lyrics
+      --no-lrc             Do not search for, embed, or save .lrc lyrics
       --no-overwrite       Skip conversion if output file already exists
 
 \x1b[1mEXAMPLES:\x1b[0m
@@ -262,7 +261,6 @@ fn process_file(
     no_overwrite: bool,
     prefer_meta_cover: bool,
     no_lrc: bool,
-    save_lrc: bool,
     stats: &Stats,
     output_lock: &Mutex<()>,
 ) {
@@ -341,8 +339,8 @@ fn process_file(
                         );
                     }
 
-                    // Only export independent .lrc sidecar file if explicitly requested
-                    if save_lrc {
+                    // Always export the clean, fused standard .lrc file alongside the dumped audio unless --no-lrc
+                    if !no_lrc {
                         if let Some(lrc_text) = crypt.lyrics() {
                             let out_lrc_path = dump_path.with_extension("lrc");
                             let _ = std::fs::write(&out_lrc_path, lrc_text);
@@ -357,7 +355,7 @@ fn process_file(
                         }
                         if let Some(ref src_lrc) = resolved_lrc {
                             let out_lrc_path = dump_path.with_extension("lrc");
-                            if (!save_lrc || src_lrc != &out_lrc_path) && src_lrc.exists() {
+                            if src_lrc != &out_lrc_path && src_lrc.exists() {
                                 let _ = std::fs::remove_file(src_lrc);
                             }
                         }
@@ -404,7 +402,6 @@ fn process_audio_file(
     no_overwrite: bool,
     prefer_meta_cover: bool,
     no_lrc: bool,
-    save_lrc: bool,
     stats: &Stats,
     output_lock: &Mutex<()>,
 ) {
@@ -533,7 +530,8 @@ fn process_audio_file(
         return;
     }
 
-    if save_lrc {
+    // Always export the clean, fused standard .lrc file alongside the audio file unless --no-lrc
+    if !no_lrc {
         if let Some((_, ref text)) = resolved_lrc {
             let out_lrc_path = target_path.with_extension("lrc");
             let _ = std::fs::write(&out_lrc_path, text);
@@ -548,7 +546,7 @@ fn process_audio_file(
         }
         if let Some((ref src_lrc, _)) = resolved_lrc {
             let out_lrc_path = target_path.with_extension("lrc");
-            if (!save_lrc || src_lrc != &out_lrc_path) && src_lrc.exists() {
+            if src_lrc != &out_lrc_path && src_lrc.exists() {
                 let _ = std::fs::remove_file(src_lrc);
             }
         }
@@ -637,7 +635,7 @@ fn main() {
     let mut no_overwrite = false;
     let mut prefer_meta_cover = false;
     let mut no_lrc = false;
-    let mut save_lrc = false;
+    let mut _save_lrc = false;
     let mut custom_meta: Option<String> = None;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -666,7 +664,7 @@ fn main() {
         } else if arg == "--prefer-meta-cover" {
             prefer_meta_cover = true;
         } else if arg == "--save-lrc" {
-            save_lrc = true;
+            _save_lrc = true;
         } else if arg == "--no-lrc" {
             no_lrc = true;
         } else if arg == "--meta" {
@@ -887,7 +885,6 @@ fn main() {
                 no_overwrite,
                 prefer_meta_cover,
                 no_lrc,
-                save_lrc,
                 &stats,
                 &output_lock,
             );
@@ -900,7 +897,6 @@ fn main() {
                 no_overwrite,
                 prefer_meta_cover,
                 no_lrc,
-                save_lrc,
                 &stats,
                 &output_lock,
             );
