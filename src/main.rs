@@ -1,4 +1,7 @@
-use ncmdump::{NcmFormat, NeteaseCrypt};
+use ncmdump::{
+    inspect_flac, inspect_mp3, mime_type, resolve_cover_image, resolve_lyrics_file,
+    update_flac_tags, update_mp3_tags, NcmFormat, NeteaseCrypt,
+};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +21,7 @@ A fast, memory-safe standalone tool to convert NetEase Cloud Music (.ncm) files.
   -v, --version            Print version information
   -d, --directory <DIR>    Process files in a directory
   -r, --recursive          Process directory recursively (requires -d or dir argument)
+  -a, --all                Also process existing .mp3 and .flac files (embed cover & fuse lyrics)
   -o, --output <DIR>       Output directory (default: same as source file)
   -m, --remove             Remove source .ncm (and .lrc) files after successful conversion
   -i, --info               Inspect metadata without decrypting audio
@@ -70,6 +74,97 @@ fn get_search_dirs(
 }
 
 fn print_info(path: &Path, custom_meta: Option<&Path>) {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if ext == "flac" || ext == "mp3" {
+        let meta_res = if ext == "flac" {
+            inspect_flac(path)
+        } else {
+            inspect_mp3(path)
+        };
+        match meta_res {
+            Ok(meta) => {
+                let search_dirs = get_search_dirs(path, None, custom_meta);
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let resolved_cover = resolve_cover_image(&search_dirs, stem, meta.music_id, meta.album_id);
+                let resolved_lrc = resolve_lyrics_file(&search_dirs, stem, meta.music_id);
+
+                println!("\x1b[1;36m┌─────────────────────────────────────────────────────────────┐\x1b[0m");
+                println!(
+                    "\x1b[1;36m│\x1b[0m \x1b[1mFile:\x1b[0m     {:<49} \x1b[1;36m│\x1b[0m",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+                );
+                if let Some(mid) = meta.music_id {
+                    println!(
+                        "\x1b[1;36m│\x1b[0m \x1b[1mTrack ID:\x1b[0m {:<49} \x1b[1;36m│\x1b[0m",
+                        mid
+                    );
+                }
+                println!(
+                    "\x1b[1;36m│\x1b[0m \x1b[1mTitle:\x1b[0m    {:<49} \x1b[1;36m│\x1b[0m",
+                    meta.title.as_deref().unwrap_or("Unknown")
+                );
+                println!(
+                    "\x1b[1;36m│\x1b[0m \x1b[1mArtist:\x1b[0m   {:<49} \x1b[1;36m│\x1b[0m",
+                    meta.artist.as_deref().unwrap_or("Unknown")
+                );
+                println!(
+                    "\x1b[1;36m│\x1b[0m \x1b[1mAlbum:\x1b[0m    {:<49} \x1b[1;36m│\x1b[0m",
+                    meta.album.as_deref().unwrap_or("Unknown")
+                );
+                println!(
+                    "\x1b[1;36m│\x1b[0m \x1b[1mFormat:\x1b[0m   {:<49} \x1b[1;36m│\x1b[0m",
+                    meta.format
+                );
+                if meta.duration > 0 {
+                    println!(
+                        "\x1b[1;36m│\x1b[0m \x1b[1mDuration:\x1b[0m {:<49} \x1b[1;36m│\x1b[0m",
+                        format_duration(meta.duration)
+                    );
+                }
+                if meta.bitrate > 0 {
+                    println!(
+                        "\x1b[1;36m│\x1b[0m \x1b[1mBitrate:\x1b[0m  {:<49} \x1b[1;36m│\x1b[0m",
+                        format!("{} kbps", meta.bitrate / 1000)
+                    );
+                }
+                let cover_info = if let Some((ref p, ref d)) = resolved_cover {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    format!("Found in meta/{} ({}, {:.1} KB)", name, mime_type(d), d.len() as f64 / 1024.0)
+                } else if meta.has_cover {
+                    "Embedded front cover".to_string()
+                } else {
+                    "None (no embedded cover or meta image)".to_string()
+                };
+                println!(
+                    "\x1b[1;36m│\x1b[0m \x1b[1mCover:\x1b[0m    {:<49} \x1b[1;36m│\x1b[0m",
+                    cover_info
+                );
+                let lrc_info = if let Some((ref p, _)) = resolved_lrc {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    format!("Found & fused ({name})")
+                } else if meta.has_lyrics {
+                    "Embedded lyrics".to_string()
+                } else {
+                    "None".to_string()
+                };
+                println!(
+                    "\x1b[1;36m│\x1b[0m \x1b[1mLyrics:\x1b[0m   {:<49} \x1b[1;36m│\x1b[0m",
+                    lrc_info
+                );
+                println!("\x1b[1;36m└─────────────────────────────────────────────────────────────┘\x1b[0m");
+            }
+            Err(e) => {
+                eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}", path.display());
+            }
+        }
+        return;
+    }
+
     match NeteaseCrypt::open(path) {
         Ok(mut crypt) => {
             let search_dirs = get_search_dirs(path, None, custom_meta);
@@ -301,15 +396,229 @@ fn process_file(
     }
 }
 
-fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn process_audio_file(
+    file_path: &Path,
+    output_folder: Option<&Path>,
+    custom_meta_dir: Option<&Path>,
+    remove: bool,
+    no_overwrite: bool,
+    prefer_meta_cover: bool,
+    no_lrc: bool,
+    save_lrc: bool,
+    stats: &Stats,
+    output_lock: &Mutex<()>,
+) {
+    if !file_path.exists() {
+        let _g = output_lock.lock().unwrap();
+        eprintln!(
+            "\x1b[1;31m✖ FAIL\x1b[0m  File '{}' does not exist.",
+            file_path.display()
+        );
+        stats.failed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    let file_name = match file_path.file_name() {
+        Some(n) => n,
+        None => return,
+    };
+    let is_inplace = output_folder.is_none() || output_folder == file_path.parent();
+    let target_path = if let Some(out_dir) = output_folder {
+        out_dir.join(file_name)
+    } else {
+        file_path.to_path_buf()
+    };
+
+    if no_overwrite && !is_inplace && target_path.exists() {
+        let _g = output_lock.lock().unwrap();
+        println!(
+            "\x1b[1;33m⚡ SKIP\x1b[0m  '{}' (already exists)",
+            file_path.display()
+        );
+        stats.skipped.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    if !is_inplace {
+        if let Some(parent) = target_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    let _g = output_lock.lock().unwrap();
+                    eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}", file_path.display());
+                    stats.failed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+        if target_path != file_path {
+            if let Err(e) = std::fs::copy(file_path, &target_path) {
+                let _g = output_lock.lock().unwrap();
+                eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}", file_path.display());
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    let ext = file_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_flac = ext == "flac";
+    let is_mp3 = ext == "mp3";
+    if !is_flac && !is_mp3 {
+        return;
+    }
+
+    let audio_meta = if is_flac {
+        inspect_flac(&target_path)
+    } else {
+        inspect_mp3(&target_path)
+    };
+
+    let audio_meta = match audio_meta {
+        Ok(m) => m,
+        Err(e) => {
+            let _g = output_lock.lock().unwrap();
+            eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}", file_path.display());
+            stats.failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    let search_dirs = get_search_dirs(file_path, output_folder, custom_meta_dir);
+    let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+    let resolved_cover = if !audio_meta.has_cover || prefer_meta_cover {
+        resolve_cover_image(&search_dirs, stem, audio_meta.music_id, audio_meta.album_id)
+    } else {
+        None
+    };
+
+    let resolved_lrc = if !no_lrc {
+        resolve_lyrics_file(&search_dirs, stem, audio_meta.music_id)
+    } else {
+        None
+    };
+
+    let cover_arg = resolved_cover.as_ref().map(|(_, d)| (d.as_slice(), mime_type(d)));
+    let lrc_arg = resolved_lrc.as_ref().map(|(_, s)| s.as_str());
+
+    let tag_res = if is_flac {
+        update_flac_tags(
+            &target_path,
+            audio_meta.netease_meta.as_ref(),
+            cover_arg,
+            lrc_arg,
+            prefer_meta_cover,
+        )
+    } else {
+        update_mp3_tags(
+            &target_path,
+            audio_meta.netease_meta.as_ref(),
+            cover_arg,
+            lrc_arg,
+            prefer_meta_cover,
+        )
+    };
+
+    if let Err(e) = tag_res {
+        let _g = output_lock.lock().unwrap();
+        eprintln!(
+            "\x1b[1;31m✖ FAIL\x1b[0m  Failed to update tags for '{}': {e}",
+            file_path.display()
+        );
+        stats.failed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    if save_lrc {
+        if let Some((_, ref text)) = resolved_lrc {
+            let out_lrc_path = target_path.with_extension("lrc");
+            let _ = std::fs::write(&out_lrc_path, text);
+        }
+    }
+
+    let mut removed_note = String::new();
+    if remove && !is_inplace {
+        match std::fs::remove_file(file_path) {
+            Ok(_) => removed_note.push_str(" \x1b[2m[source removed]\x1b[0m"),
+            Err(e) => removed_note.push_str(&format!(" \x1b[1;31m[failed to remove audio: {e}]\x1b[0m")),
+        }
+        if let Some((ref src_lrc, _)) = resolved_lrc {
+            let out_lrc_path = target_path.with_extension("lrc");
+            if (!save_lrc || src_lrc != &out_lrc_path) && src_lrc.exists() {
+                let _ = std::fs::remove_file(src_lrc);
+            }
+        }
+    }
+
+    let meta_summary = match (&audio_meta.title, &audio_meta.artist) {
+        (Some(t), Some(a)) => format!(" ({t} - {a})"),
+        (Some(t), None) => format!(" ({t})"),
+        _ => String::new(),
+    };
+
+    let cover_note = if let Some((ref p, _)) = resolved_cover {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("meta");
+        format!(" \x1b[2;36m[cover: {name}]\x1b[0m")
+    } else if audio_meta.has_cover {
+        " \x1b[2;36m[cover: embedded]\x1b[0m".to_string()
+    } else {
+        " \x1b[2;33m[no cover]\x1b[0m".to_string()
+    };
+
+    let lrc_note = if let Some((ref p, _)) = resolved_lrc {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("lrc");
+        format!(" \x1b[2;35m[lyrics: {name}]\x1b[0m")
+    } else if audio_meta.has_lyrics {
+        " \x1b[2;35m[lyrics: embedded]\x1b[0m".to_string()
+    } else {
+        String::new()
+    };
+
+    let _g = output_lock.lock().unwrap();
+    if is_inplace {
+        println!(
+            "\x1b[1;32m✔ DONE\x1b[0m  '{}'{}{}{}{}",
+            file_path.display(),
+            meta_summary,
+            cover_note,
+            lrc_note,
+            removed_note
+        );
+    } else {
+        println!(
+            "\x1b[1;32m✔ DONE\x1b[0m  '{}' \x1b[2m->\x1b[0m '\x1b[36m{}\x1b[0m'{}{}{}{}",
+            file_path.display(),
+            target_path.display(),
+            meta_summary,
+            cover_note,
+            lrc_note,
+            removed_note
+        );
+    }
+    stats.succeeded.fetch_add(1, Ordering::Relaxed);
+}
+
+fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>, all_audio: bool) -> std::io::Result<()> {
     if dir.is_dir() {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                walk_dir_recursive(&path, files)?;
-            } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("ncm") {
-                files.push(path);
+                walk_dir_recursive(&path, files, all_audio)?;
+            } else if path.is_file() {
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+                let is_ncm = ext.as_deref() == Some("ncm");
+                let is_audio = ext.as_deref() == Some("flac") || ext.as_deref() == Some("mp3");
+                if is_ncm || (all_audio && is_audio) {
+                    files.push(path);
+                }
             }
         }
     }
@@ -324,6 +633,7 @@ fn main() {
     let mut recursive = false;
     let mut remove = false;
     let mut info_mode = false;
+    let mut all_audio = false;
     let mut no_overwrite = false;
     let mut prefer_meta_cover = false;
     let mut no_lrc = false;
@@ -347,6 +657,8 @@ fn main() {
             recursive = true;
         } else if arg == "-m" || arg == "--remove" {
             remove = true;
+        } else if arg == "-a" || arg == "--all" {
+            all_audio = true;
         } else if arg == "-i" || arg == "--info" {
             info_mode = true;
         } else if arg == "--no-overwrite" {
@@ -477,7 +789,7 @@ fn main() {
 
         if recursive {
             let mut all_files = Vec::new();
-            if let Err(e) = walk_dir_recursive(&source_dir, &mut all_files) {
+            if let Err(e) = walk_dir_recursive(&source_dir, &mut all_files, all_audio) {
                 eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  Failed to read directory: {e}");
                 process::exit(1);
             }
@@ -501,13 +813,21 @@ fn main() {
                 Ok(entries) => {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("ncm") {
-                            let out_folder = if output_dir_specified {
-                                Some(output_dir.clone())
-                            } else {
-                                None
-                            };
-                            task_list.push((path, out_folder));
+                        if path.is_file() {
+                            let ext = path
+                                .extension()
+                                .and_then(|s| s.to_str())
+                                .map(|s| s.to_ascii_lowercase());
+                            let is_ncm = ext.as_deref() == Some("ncm");
+                            let is_audio = ext.as_deref() == Some("flac") || ext.as_deref() == Some("mp3");
+                            if is_ncm || (all_audio && is_audio) {
+                                let out_folder = if output_dir_specified {
+                                    Some(output_dir.clone())
+                                } else {
+                                    None
+                                };
+                                task_list.push((path, out_folder));
+                            }
                         }
                     }
                 }
@@ -528,12 +848,20 @@ fn main() {
                 stats.failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            let out_folder = if output_dir_specified {
-                Some(output_dir.clone())
-            } else {
-                None
-            };
-            task_list.push((path, out_folder));
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_ascii_lowercase());
+            let is_ncm = ext.as_deref() == Some("ncm");
+            let is_audio = ext.as_deref() == Some("flac") || ext.as_deref() == Some("mp3");
+            if is_ncm || (all_audio && is_audio) {
+                let out_folder = if output_dir_specified {
+                    Some(output_dir.clone())
+                } else {
+                    None
+                };
+                task_list.push((path, out_folder));
+            }
         }
     }
 
@@ -544,12 +872,29 @@ fn main() {
         return;
     }
 
-    // Execute tasks in parallel or sequential based on task count
-    if task_list.len() <= 1 || threads <= 1 {
-        for (file_path, out_folder) in &task_list {
+    let run_task = |file_path: &Path, out_folder: Option<&Path>| {
+        let ext = file_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if ext == "ncm" {
             process_file(
                 file_path,
-                out_folder.as_deref(),
+                out_folder,
+                meta_path,
+                remove,
+                no_overwrite,
+                prefer_meta_cover,
+                no_lrc,
+                save_lrc,
+                &stats,
+                &output_lock,
+            );
+        } else if ext == "flac" || ext == "mp3" {
+            process_audio_file(
+                file_path,
+                out_folder,
                 meta_path,
                 remove,
                 no_overwrite,
@@ -560,12 +905,17 @@ fn main() {
                 &output_lock,
             );
         }
+    };
+
+    // Execute tasks in parallel or sequential based on task count
+    if task_list.len() <= 1 || threads <= 1 {
+        for (file_path, out_folder) in &task_list {
+            run_task(file_path, out_folder.as_deref());
+        }
     } else {
         use std::sync::atomic::AtomicUsize;
         let index = AtomicUsize::new(0);
         let task_ref = &task_list;
-        let stats_ref = &stats;
-        let lock_ref = &output_lock;
 
         std::thread::scope(|s| {
             for _ in 0..threads.min(task_list.len()) {
@@ -575,18 +925,7 @@ fn main() {
                         break;
                     }
                     let (file_path, out_folder) = &task_ref[i];
-                    process_file(
-                        file_path,
-                        out_folder.as_deref(),
-                        meta_path,
-                        remove,
-                        no_overwrite,
-                        prefer_meta_cover,
-                        no_lrc,
-                        save_lrc,
-                        stats_ref,
-                        lock_ref,
-                    );
+                    run_task(file_path, out_folder.as_deref());
                 });
             }
         });
@@ -600,7 +939,7 @@ fn main() {
         let fail = stats.failed.load(Ordering::Relaxed);
         println!("\x1b[2m─────────────────────────────────────────────────────────────\x1b[0m");
         println!(
-            "\x1b[1;32m✨ Complete:\x1b[0m {} converted, {} skipped, {} failed in {:.2?}",
+            "\x1b[1;32m✨ Complete:\x1b[0m {} processed, {} skipped, {} failed in {:.2?}",
             succ, skip, fail, elapsed
         );
     }

@@ -300,40 +300,14 @@ impl NeteaseCrypt {
     /// Attempt to load a cover image from a specific directory (e.g. ~/meta or output/meta).
     /// Looks for track-{musicId}.jpg/png, {musicId}.jpg/png, album-{albumId}.jpg/png.
     pub fn load_cover_from_meta_dir(&mut self, meta_dir: &Path) -> Option<PathBuf> {
-        let meta = self.metadata.as_ref()?;
-        let mut candidate_filenames = Vec::new();
-
-        if let Some(mid) = meta.music_id {
-            candidate_filenames.push(format!("track-{mid}.jpg"));
-            candidate_filenames.push(format!("track-{mid}.jpeg"));
-            candidate_filenames.push(format!("track-{mid}.png"));
-            candidate_filenames.push(format!("track-{mid}"));
-            candidate_filenames.push(format!("{mid}.jpg"));
-            candidate_filenames.push(format!("{mid}.jpeg"));
-            candidate_filenames.push(format!("{mid}.png"));
+        let stem = self.filepath.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let (mid, aid) = self.metadata.as_ref().map(|m| (m.music_id, m.album_id)).unwrap_or((None, None));
+        if let Some((path, data)) = resolve_cover_image(&[meta_dir.to_path_buf()], stem, mid, aid) {
+            self.image_data = data;
+            Some(path)
+        } else {
+            None
         }
-
-        if let Some(aid) = meta.album_id {
-            candidate_filenames.push(format!("album-{aid}.jpg"));
-            candidate_filenames.push(format!("album-{aid}.jpeg"));
-            candidate_filenames.push(format!("album-{aid}.png"));
-            candidate_filenames.push(format!("{aid}.jpg"));
-            candidate_filenames.push(format!("{aid}.jpeg"));
-            candidate_filenames.push(format!("{aid}.png"));
-        }
-
-        for name in candidate_filenames {
-            let candidate_path = meta_dir.join(&name);
-            if candidate_path.is_file() {
-                if let Ok(bytes) = std::fs::read(&candidate_path) {
-                    if !bytes.is_empty() {
-                        self.image_data = bytes;
-                        return Some(candidate_path);
-                    }
-                }
-            }
-        }
-        None
     }
 
     /// Searches candidate directories for a matching cover image when the .ncm file
@@ -347,23 +321,14 @@ impl NeteaseCrypt {
         if !self.image_data.is_empty() && !force {
             return None;
         }
-
-        for dir in search_dirs {
-            // First check <dir>/meta
-            let meta_subdir = dir.join("meta");
-            if meta_subdir.is_dir() {
-                if let Some(found) = self.load_cover_from_meta_dir(&meta_subdir) {
-                    return Some(found);
-                }
-            }
-            // Also check <dir> directly
-            if dir.is_dir() {
-                if let Some(found) = self.load_cover_from_meta_dir(dir) {
-                    return Some(found);
-                }
-            }
+        let stem = self.filepath.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let (mid, aid) = self.metadata.as_ref().map(|m| (m.music_id, m.album_id)).unwrap_or((None, None));
+        if let Some((path, data)) = resolve_cover_image(search_dirs, stem, mid, aid) {
+            self.image_data = data;
+            Some(path)
+        } else {
+            None
         }
-        None
     }
 
     /// Returns a reference to the loaded/fused lyrics, if any.
@@ -380,39 +345,14 @@ impl NeteaseCrypt {
     /// Looks for `<stem>.lrc`, `track-{musicId}.lrc`, `{musicId}.lrc` in `<dir>` and `<dir>/meta`.
     /// When found, parses and fuses any JSON-formatted metadata/lines into standard LRC timestamps.
     pub fn try_resolve_lyrics(&mut self, search_dirs: &[PathBuf]) -> Option<PathBuf> {
-        let stem = self.filepath.file_stem().and_then(|s| s.to_str())?;
-        let mut candidate_names = vec![format!("{stem}.lrc")];
-
-        if let Some(ref meta) = self.metadata {
-            if let Some(mid) = meta.music_id {
-                candidate_names.push(format!("track-{mid}.lrc"));
-                candidate_names.push(format!("{mid}.lrc"));
-            }
+        let stem = self.filepath.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let mid = self.metadata.as_ref().and_then(|m| m.music_id);
+        if let Some((path, fused)) = resolve_lyrics_file(search_dirs, stem, mid) {
+            self.lyrics = Some(fused);
+            Some(path)
+        } else {
+            None
         }
-
-        for dir in search_dirs {
-            for name in &candidate_names {
-                // Check <dir>/<name>
-                let p1 = dir.join(name);
-                if p1.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&p1) {
-                        let fused = parse_and_fuse_lrc(&content);
-                        self.lyrics = Some(fused);
-                        return Some(p1);
-                    }
-                }
-                // Check <dir>/meta/<name>
-                let p2 = dir.join("meta").join(name);
-                if p2.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&p2) {
-                        let fused = parse_and_fuse_lrc(&content);
-                        self.lyrics = Some(fused);
-                        return Some(p2);
-                    }
-                }
-            }
-        }
-        None
     }
 
     pub fn dump<P: AsRef<Path>>(
@@ -569,3 +509,397 @@ pub fn parse_and_fuse_lrc(content: &str) -> String {
     }
     out_lines.join("\n")
 }
+
+/// Attempts to parse 163 key NetEase metadata embedded in comment or description fields.
+pub fn parse_163_key(raw: &str) -> Option<NeteaseMusicMetadata> {
+    let b64_candidate = if let Some(pos) = raw.find("163 key(Don't modify):") {
+        &raw[pos + "163 key(Don't modify):".len()..]
+    } else {
+        raw
+    };
+    let b64_candidate = b64_candidate.trim();
+    if let Ok(b64_decoded) = BASE64_STANDARD.decode(b64_candidate.as_bytes()) {
+        let decrypted_meta = aes_128_ecb_decrypt(&MODIFY_KEY, &b64_decoded);
+        if decrypted_meta.len() >= 6 {
+            if let Ok(json_str) = std::str::from_utf8(&decrypted_meta[6..]) {
+                if let Some(m) = parse_metadata(json_str) {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    parse_metadata(raw)
+}
+
+/// Resolves an album cover image from candidate search directories.
+/// Checks candidate names for stem, track/music ID, album ID, and generic cover names
+/// under each directory's `meta/` subfolder and the directory itself.
+pub fn resolve_cover_image(
+    search_dirs: &[PathBuf],
+    stem: &str,
+    music_id: Option<u64>,
+    album_id: Option<u64>,
+) -> Option<(PathBuf, Vec<u8>)> {
+    let mut candidate_filenames = Vec::new();
+
+    if !stem.is_empty() {
+        candidate_filenames.push(format!("{stem}.jpg"));
+        candidate_filenames.push(format!("{stem}.jpeg"));
+        candidate_filenames.push(format!("{stem}.png"));
+    }
+
+    if let Some(mid) = music_id {
+        candidate_filenames.push(format!("track-{mid}.jpg"));
+        candidate_filenames.push(format!("track-{mid}.jpeg"));
+        candidate_filenames.push(format!("track-{mid}.png"));
+        candidate_filenames.push(format!("track-{mid}"));
+        candidate_filenames.push(format!("{mid}.jpg"));
+        candidate_filenames.push(format!("{mid}.jpeg"));
+        candidate_filenames.push(format!("{mid}.png"));
+    }
+
+    if let Some(aid) = album_id {
+        candidate_filenames.push(format!("album-{aid}.jpg"));
+        candidate_filenames.push(format!("album-{aid}.jpeg"));
+        candidate_filenames.push(format!("album-{aid}.png"));
+        candidate_filenames.push(format!("{aid}.jpg"));
+        candidate_filenames.push(format!("{aid}.jpeg"));
+        candidate_filenames.push(format!("{aid}.png"));
+    }
+
+    candidate_filenames.push("cover.jpg".to_string());
+    candidate_filenames.push("cover.jpeg".to_string());
+    candidate_filenames.push("cover.png".to_string());
+    candidate_filenames.push("folder.jpg".to_string());
+    candidate_filenames.push("folder.jpeg".to_string());
+    candidate_filenames.push("folder.png".to_string());
+    candidate_filenames.push("front.jpg".to_string());
+    candidate_filenames.push("front.jpeg".to_string());
+    candidate_filenames.push("front.png".to_string());
+
+    for dir in search_dirs {
+        for name in &candidate_filenames {
+            let p1 = dir.join("meta").join(name);
+            if p1.is_file() {
+                if let Ok(bytes) = std::fs::read(&p1) {
+                    if !bytes.is_empty() {
+                        return Some((p1, bytes));
+                    }
+                }
+            }
+            let p2 = dir.join(name);
+            if p2.is_file() {
+                if let Ok(bytes) = std::fs::read(&p2) {
+                    if !bytes.is_empty() {
+                        return Some((p2, bytes));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolves a lyrics file from candidate search directories.
+/// Looks for `<stem>.lrc`, `track-{musicId}.lrc`, `{musicId}.lrc`.
+/// When found, parses and fuses hybrid JSON/LRC into standard timestamps.
+pub fn resolve_lyrics_file(
+    search_dirs: &[PathBuf],
+    stem: &str,
+    music_id: Option<u64>,
+) -> Option<(PathBuf, String)> {
+    let mut candidate_names = Vec::new();
+    if !stem.is_empty() {
+        candidate_names.push(format!("{stem}.lrc"));
+    }
+    if let Some(mid) = music_id {
+        candidate_names.push(format!("track-{mid}.lrc"));
+        candidate_names.push(format!("{mid}.lrc"));
+    }
+
+    for dir in search_dirs {
+        for name in &candidate_names {
+            let p1 = dir.join(name);
+            if p1.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&p1) {
+                    let fused = parse_and_fuse_lrc(&content);
+                    return Some((p1, fused));
+                }
+            }
+            let p2 = dir.join("meta").join(name);
+            if p2.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&p2) {
+                    let fused = parse_and_fuse_lrc(&content);
+                    return Some((p2, fused));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AudioMetadata {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub format: String,
+    pub duration: i64,
+    pub bitrate: i64,
+    pub music_id: Option<u64>,
+    pub album_id: Option<u64>,
+    pub has_cover: bool,
+    pub has_lyrics: bool,
+    pub netease_meta: Option<NeteaseMusicMetadata>,
+}
+
+pub fn inspect_flac(path: &Path) -> Result<AudioMetadata, Box<dyn std::error::Error>> {
+    let tag = metaflac::Tag::read_from_path(path)?;
+    let mut meta = AudioMetadata {
+        format: "FLAC (lossless)".to_string(),
+        ..Default::default()
+    };
+
+    if let Some(info) = tag.get_streaminfo() {
+        if info.sample_rate > 0 {
+            meta.duration = (info.total_samples as f64 / info.sample_rate as f64 * 1000.0) as i64;
+        }
+    }
+
+    if let Some(comments) = tag.vorbis_comments() {
+        meta.title = comments.title().and_then(|v| v.first()).cloned();
+        meta.artist = comments.artist().and_then(|v| v.first()).cloned();
+        meta.album = comments.album().and_then(|v| v.first()).cloned();
+        meta.has_lyrics = comments.get("LYRICS").is_some() || comments.get("UNSYNCEDLYRICS").is_some();
+
+        for values in comments.comments.values() {
+            for val in values {
+                if let Some(parsed) = parse_163_key(val) {
+                    meta.netease_meta = Some(parsed);
+                    break;
+                }
+            }
+            if meta.netease_meta.is_some() {
+                break;
+            }
+        }
+    }
+
+    if let Some(ref m) = meta.netease_meta {
+        if meta.title.is_none() && !m.name.is_empty() {
+            meta.title = Some(m.name.clone());
+        }
+        if meta.artist.is_none() && !m.artist.is_empty() {
+            meta.artist = Some(m.artist.clone());
+        }
+        if meta.album.is_none() && !m.album.is_empty() {
+            meta.album = Some(m.album.clone());
+        }
+        if meta.duration == 0 && m.duration > 0 {
+            meta.duration = m.duration;
+        }
+        if m.bitrate > 0 {
+            meta.bitrate = m.bitrate;
+        }
+        meta.music_id = m.music_id;
+        meta.album_id = m.album_id;
+    }
+
+    if meta.music_id.is_none() {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let candidate = if let Some(stripped) = stem.strip_prefix("track-") {
+            stripped
+        } else {
+            stem
+        };
+        if let Ok(id) = candidate.parse::<u64>() {
+            meta.music_id = Some(id);
+        }
+    }
+
+    meta.has_cover = tag
+        .pictures()
+        .any(|p| p.picture_type == metaflac::block::PictureType::CoverFront);
+
+    Ok(meta)
+}
+
+pub fn inspect_mp3(path: &Path) -> Result<AudioMetadata, Box<dyn std::error::Error>> {
+    let tag = id3::Tag::read_from_path(path).unwrap_or_else(|_| id3::Tag::new());
+    let mut meta = AudioMetadata {
+        title: tag.title().map(|s| s.to_string()),
+        artist: tag.artist().map(|s| s.to_string()),
+        album: tag.album().map(|s| s.to_string()),
+        format: "MP3".to_string(),
+        has_lyrics: tag.lyrics().next().is_some(),
+        has_cover: tag
+            .pictures()
+            .any(|p| p.picture_type == id3::frame::PictureType::CoverFront),
+        ..Default::default()
+    };
+
+    for comment in tag.comments() {
+        if let Some(parsed) = parse_163_key(&comment.text) {
+            meta.netease_meta = Some(parsed);
+            break;
+        }
+    }
+    if meta.netease_meta.is_none() {
+        for frame in tag.extended_texts() {
+            if let Some(parsed) = parse_163_key(&frame.value) {
+                meta.netease_meta = Some(parsed);
+                break;
+            }
+        }
+    }
+
+    if let Some(ref m) = meta.netease_meta {
+        if meta.title.is_none() && !m.name.is_empty() {
+            meta.title = Some(m.name.clone());
+        }
+        if meta.artist.is_none() && !m.artist.is_empty() {
+            meta.artist = Some(m.artist.clone());
+        }
+        if meta.album.is_none() && !m.album.is_empty() {
+            meta.album = Some(m.album.clone());
+        }
+        if m.duration > 0 {
+            meta.duration = m.duration;
+        }
+        if m.bitrate > 0 {
+            meta.bitrate = m.bitrate;
+        }
+        meta.music_id = m.music_id;
+        meta.album_id = m.album_id;
+    }
+
+    if meta.music_id.is_none() {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let candidate = if let Some(stripped) = stem.strip_prefix("track-") {
+            stripped
+        } else {
+            stem
+        };
+        if let Ok(id) = candidate.parse::<u64>() {
+            meta.music_id = Some(id);
+        }
+    }
+
+    Ok(meta)
+}
+
+pub fn update_flac_tags(
+    path: &Path,
+    netease_meta: Option<&NeteaseMusicMetadata>,
+    cover: Option<(&[u8], &'static str)>,
+    lyrics: Option<&str>,
+    prefer_meta_cover: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tag = metaflac::Tag::read_from_path(path)?;
+    let mut changed = false;
+
+    if let Some(meta) = netease_meta {
+        let comments = tag.vorbis_comments_mut();
+        if comments.title().is_none() && !meta.name.is_empty() {
+            comments.set_title(vec![meta.name.clone()]);
+            changed = true;
+        }
+        if comments.artist().is_none() && !meta.artist.is_empty() {
+            comments.set_artist(vec![meta.artist.clone()]);
+            changed = true;
+        }
+        if comments.album().is_none() && !meta.album.is_empty() {
+            comments.set_album(vec![meta.album.clone()]);
+            changed = true;
+        }
+    }
+
+    if let Some((data, mime)) = cover {
+        let has_cover = tag
+            .pictures()
+            .any(|p| p.picture_type == metaflac::block::PictureType::CoverFront);
+        if !has_cover || prefer_meta_cover {
+            if prefer_meta_cover {
+                tag.remove_picture_type(metaflac::block::PictureType::CoverFront);
+            }
+            tag.add_picture(
+                mime,
+                metaflac::block::PictureType::CoverFront,
+                data.to_vec(),
+            );
+            changed = true;
+        }
+    }
+
+    if let Some(lrc) = lyrics {
+        let comments = tag.vorbis_comments_mut();
+        comments.set("LYRICS", vec![lrc.to_string()]);
+        comments.set("UNSYNCEDLYRICS", vec![lrc.to_string()]);
+        changed = true;
+    }
+
+    if changed {
+        tag.save()?;
+    }
+    Ok(())
+}
+
+pub fn update_mp3_tags(
+    path: &Path,
+    netease_meta: Option<&NeteaseMusicMetadata>,
+    cover: Option<(&[u8], &'static str)>,
+    lyrics: Option<&str>,
+    prefer_meta_cover: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tag = id3::Tag::read_from_path(path).unwrap_or_else(|_| id3::Tag::new());
+    let mut changed = false;
+
+    if let Some(meta) = netease_meta {
+        if tag.title().is_none() && !meta.name.is_empty() {
+            tag.set_title(&meta.name);
+            changed = true;
+        }
+        if tag.artist().is_none() && !meta.artist.is_empty() {
+            tag.set_artist(&meta.artist);
+            changed = true;
+        }
+        if tag.album().is_none() && !meta.album.is_empty() {
+            tag.set_album(&meta.album);
+            changed = true;
+        }
+    }
+
+    if let Some((data, mime)) = cover {
+        let has_cover = tag
+            .pictures()
+            .any(|p| p.picture_type == id3::frame::PictureType::CoverFront);
+        if !has_cover || prefer_meta_cover {
+            if prefer_meta_cover {
+                tag.remove_all_pictures();
+            }
+            tag.add_frame(id3::frame::Picture {
+                mime_type: mime.to_string(),
+                picture_type: id3::frame::PictureType::CoverFront,
+                description: String::new(),
+                data: data.to_vec(),
+            });
+            changed = true;
+        }
+    }
+
+    if let Some(lrc) = lyrics {
+        tag.remove_all_lyrics();
+        tag.add_frame(id3::frame::Lyrics {
+            lang: "XXX".to_string(),
+            description: String::new(),
+            text: lrc.to_string(),
+        });
+        changed = true;
+    }
+
+    if changed {
+        tag.write_to_path(path, id3::Version::Id3v24)?;
+    }
+    Ok(())
+}
+
