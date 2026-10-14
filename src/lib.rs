@@ -564,6 +564,18 @@ pub fn resolve_cover_image(
         candidate_filenames.push(format!("{stem}.jpg"));
         candidate_filenames.push(format!("{stem}.jpeg"));
         candidate_filenames.push(format!("{stem}.png"));
+
+        // If stem ends with duplicate suffix like " (1)", also check base name
+        if let Some(idx) = stem.rfind(" (") {
+            if stem.ends_with(')') {
+                let base = &stem[..idx];
+                if !base.is_empty() {
+                    candidate_filenames.push(format!("{base}.jpg"));
+                    candidate_filenames.push(format!("{base}.jpeg"));
+                    candidate_filenames.push(format!("{base}.png"));
+                }
+            }
+        }
     }
 
     if let Some(mid) = music_id {
@@ -629,6 +641,14 @@ pub fn resolve_lyrics_file(
     let mut candidate_names = Vec::new();
     if !stem.is_empty() {
         candidate_names.push(format!("{stem}.lrc"));
+        if let Some(idx) = stem.rfind(" (") {
+            if stem.ends_with(')') {
+                let base = &stem[..idx];
+                if !base.is_empty() {
+                    candidate_names.push(format!("{base}.lrc"));
+                }
+            }
+        }
     }
     if let Some(mid) = music_id {
         candidate_names.push(format!("track-{mid}.lrc"));
