@@ -113,9 +113,9 @@ fn test_lyrics_parsing_and_fusing() {
     let fused = ncmdump::parse_and_fuse_lrc(raw_lrc);
     println!("Fused LRC:\n{fused}");
 
-    assert!(fused.contains("[00:00.000] 编曲: 1AN孙毅然"));
-    assert!(fused.contains("[00:01.000] 作词: 锦衣小盆友"));
-    assert!(fused.contains("[00:02.000] 作曲: 银临"));
+    assert!(fused.contains("[00:00.00] 编曲: 1AN孙毅然"));
+    assert!(fused.contains("[00:01.00] 作词: 锦衣小盆友"));
+    assert!(fused.contains("[00:02.00] 作曲: 银临"));
     assert!(fused.contains("[00:06.395] 编曲Arranger：1AN孙毅然"));
     assert!(fused.contains("[00:18.260] 你名字是揉碎、漂浮的，二三云朵，"));
 
@@ -137,7 +137,7 @@ fn test_lyrics_parsing_and_fusing() {
     let out_file = crypt.dump(Some(&temp_dir)).expect("Dump audio");
     crypt.fix_metadata().expect("Fix metadata");
 
-    // Verify FLAC vorbis comments contain lyrics
+    // Verify FLAC vorbis comments contain lyrics directly in LYRICS tag
     let flac_tag = metaflac::Tag::read_from_path(&out_file).expect("Read flac tag");
     let vorbis = flac_tag.vorbis_comments().expect("Vorbis comments");
     assert_eq!(vorbis.get("LYRICS").map(|v| v.as_slice()), Some(&[fused.clone()][..]));
@@ -188,7 +188,7 @@ fn test_audio_metadata_inspection_and_tag_updating() {
     assert!(resolved_lrc.is_some());
     let (l_path, l_text) = resolved_lrc.unwrap();
     assert_eq!(l_path, lrc_path);
-    assert!(l_text.contains("[00:00.000] 测试歌词"));
+    assert!(l_text.contains("[00:00.00] 测试歌词"));
 
     // Update tags
     ncmdump::update_mp3_tags(
@@ -206,7 +206,7 @@ fn test_audio_metadata_inspection_and_tag_updating() {
 
     let read_tag = id3::Tag::read_from_path(&mp3_path).unwrap();
     assert_eq!(read_tag.pictures().count(), 1);
-    assert_eq!(read_tag.lyrics().next().unwrap().text, "[00:00.000] 测试歌词");
+    assert_eq!(read_tag.lyrics().next().unwrap().text, "[00:00.00] 测试歌词");
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -262,13 +262,15 @@ fn test_cli_all_audio_directory_flag() {
 
     let dest_mp3 = out_dir.join("track-999.mp3");
     assert!(dest_mp3.exists());
+    // Assert NO standalone .lrc file was generated in output!
+    assert!(!out_dir.join("track-999.lrc").exists());
 
     let dest_tag = id3::Tag::read_from_path(&dest_mp3).expect("Read dest tag");
     assert_eq!(dest_tag.title(), Some("Test Song 999"));
     assert_eq!(dest_tag.artist(), Some("Test Singer"));
     assert_eq!(dest_tag.pictures().count(), 1);
     let lyrics = dest_tag.lyrics().next().expect("Lyrics present");
-    assert_eq!(lyrics.text, "[00:01.500] 你好世界");
+    assert_eq!(lyrics.text, "[00:01.50] 你好世界");
 
     let _ = std::fs::remove_dir_all(&temp_root);
 }
@@ -316,11 +318,13 @@ fn test_cli_all_audio_flac_recursive() {
 
     let dest_flac = out_dir.join("subfolder").join("my_song.flac");
     assert!(dest_flac.exists());
+    // Assert NO standalone .lrc file was generated in output!
+    assert!(!out_dir.join("subfolder").join("my_song.lrc").exists());
 
     let flac_tag = metaflac::Tag::read_from_path(&dest_flac).expect("Read flac tag");
     let vorbis = flac_tag.vorbis_comments().expect("Vorbis comments");
     assert_eq!(vorbis.get("LYRICS").map(|v| v.as_slice()), Some(&["[00:03.141] Pi Song".to_string()][..]));
-    assert_eq!(vorbis.get("UNSYNCEDLYRICS").map(|v| v.as_slice()), Some(&["[00:03.141] Pi Song".to_string()][..]));
+    assert_eq!(vorbis.get("UNSYNCEDLYRICS"), None);
 
     let _ = std::fs::remove_dir_all(&temp_root);
 }

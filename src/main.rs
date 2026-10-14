@@ -67,8 +67,20 @@ fn get_search_dirs(
     if let Some(parent) = file_path.parent() {
         if !parent.as_os_str().is_empty() {
             dirs.push(parent.to_path_buf());
+        } else {
+            dirs.push(PathBuf::from("."));
         }
+    } else {
+        dirs.push(PathBuf::from("."));
     }
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join("meta"));
+        dirs.push(home.join("Music").join("meta"));
+        dirs.push(home.join("Music").join("网易云音乐").join("meta"));
+        dirs.push(home.join("Music").join("网易云音乐"));
+    }
+
     dirs
 }
 
@@ -339,14 +351,6 @@ fn process_file(
                         );
                     }
 
-                    // Always export the clean, fused standard .lrc file alongside the dumped audio unless --no-lrc
-                    if !no_lrc {
-                        if let Some(lrc_text) = crypt.lyrics() {
-                            let out_lrc_path = dump_path.with_extension("lrc");
-                            let _ = std::fs::write(&out_lrc_path, lrc_text);
-                        }
-                    }
-
                     let mut removed_note = String::new();
                     if remove {
                         match std::fs::remove_file(file_path) {
@@ -354,8 +358,7 @@ fn process_file(
                             Err(e) => removed_note.push_str(&format!(" \x1b[1;31m[failed to remove ncm: {e}]\x1b[0m")),
                         }
                         if let Some(ref src_lrc) = resolved_lrc {
-                            let out_lrc_path = dump_path.with_extension("lrc");
-                            if src_lrc != &out_lrc_path && src_lrc.exists() {
+                            if src_lrc.exists() {
                                 let _ = std::fs::remove_file(src_lrc);
                             }
                         }
@@ -530,23 +533,16 @@ fn process_audio_file(
         return;
     }
 
-    // Always export the clean, fused standard .lrc file alongside the audio file unless --no-lrc
-    if !no_lrc {
-        if let Some((_, ref text)) = resolved_lrc {
-            let out_lrc_path = target_path.with_extension("lrc");
-            let _ = std::fs::write(&out_lrc_path, text);
-        }
-    }
-
     let mut removed_note = String::new();
-    if remove && !is_inplace {
-        match std::fs::remove_file(file_path) {
-            Ok(_) => removed_note.push_str(" \x1b[2m[source removed]\x1b[0m"),
-            Err(e) => removed_note.push_str(&format!(" \x1b[1;31m[failed to remove audio: {e}]\x1b[0m")),
+    if remove {
+        if !is_inplace {
+            match std::fs::remove_file(file_path) {
+                Ok(_) => removed_note.push_str(" \x1b[2m[source removed]\x1b[0m"),
+                Err(e) => removed_note.push_str(&format!(" \x1b[1;31m[failed to remove audio: {e}]\x1b[0m")),
+            }
         }
         if let Some((ref src_lrc, _)) = resolved_lrc {
-            let out_lrc_path = target_path.with_extension("lrc");
-            if src_lrc != &out_lrc_path && src_lrc.exists() {
+            if src_lrc.exists() {
                 let _ = std::fs::remove_file(src_lrc);
             }
         }

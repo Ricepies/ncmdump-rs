@@ -466,9 +466,9 @@ impl NeteaseCrypt {
                 }
                 if let Some(ref lrc) = self.lyrics {
                     let comments = tag.vorbis_comments_mut();
+                    comments.comments.remove("UNSYNCEDLYRICS");
+                    comments.comments.remove("SYNCEDLYRICS");
                     comments.set("LYRICS", vec![lrc.clone()]);
-                    comments.set("UNSYNCEDLYRICS", vec![lrc.clone()]);
-                    comments.set("SYNCEDLYRICS", vec![lrc.clone()]);
                 }
                 tag.save()?;
             }
@@ -478,7 +478,7 @@ impl NeteaseCrypt {
 }
 
 /// Fuses NetEase hybrid JSON lines (`{"t": 0, "c": [{"tx": "..."}]}`) and standard LRC lines
-/// into unified standard LRC format `[mm:ss.xxx] text`.
+/// into unified standard LRC format `[mm:ss.xx] text`.
 pub fn parse_and_fuse_lrc(content: &str) -> String {
     let content_trimmed = content.trim().trim_start_matches('\u{feff}');
     // Check if the entire file is a NetEase JSON response (e.g. {"lrc": {"lyric": "..."}})
@@ -501,7 +501,7 @@ pub fn parse_and_fuse_lrc(content: &str) -> String {
                 if let Some(t) = v.get("t").and_then(|t| t.as_i64()) {
                     let mins = t / 60000;
                     let secs = (t % 60000) / 1000;
-                    let ms = t % 1000;
+                    let hundredths = (t % 1000) / 10;
                     let mut text = String::new();
                     if let Some(c) = v.get("c").and_then(|c| c.as_array()) {
                         for item in c {
@@ -515,9 +515,9 @@ pub fn parse_and_fuse_lrc(content: &str) -> String {
                         text.push_str(s);
                     }
                     if text.is_empty() {
-                        out_lines.push(format!("[{mins:02}:{secs:02}.{ms:03}]"));
+                        out_lines.push(format!("[{mins:02}:{secs:02}.{hundredths:02}]"));
                     } else {
-                        out_lines.push(format!("[{mins:02}:{secs:02}.{ms:03}] {text}"));
+                        out_lines.push(format!("[{mins:02}:{secs:02}.{hundredths:02}] {text}"));
                     }
                     continue;
                 }
@@ -851,9 +851,9 @@ pub fn update_flac_tags(
 
     if let Some(lrc) = lyrics {
         let comments = tag.vorbis_comments_mut();
+        comments.comments.remove("UNSYNCEDLYRICS");
+        comments.comments.remove("SYNCEDLYRICS");
         comments.set("LYRICS", vec![lrc.to_string()]);
-        comments.set("UNSYNCEDLYRICS", vec![lrc.to_string()]);
-        comments.set("SYNCEDLYRICS", vec![lrc.to_string()]);
         changed = true;
     }
 
