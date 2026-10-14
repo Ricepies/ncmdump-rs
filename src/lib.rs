@@ -164,6 +164,7 @@ pub struct NeteaseCrypt {
     dump_filepath: Option<PathBuf>,
     format: NcmFormat,
     image_data: Vec<u8>,
+    lyrics: Option<String>,
     mask_table: [u8; 256],
     metadata: Option<NeteaseMusicMetadata>,
     audio_offset: u64,
@@ -273,6 +274,7 @@ impl NeteaseCrypt {
             dump_filepath: None,
             format: NcmFormat::Mp3,
             image_data,
+            lyrics: None,
             mask_table,
             metadata,
             audio_offset,
@@ -372,6 +374,55 @@ impl NeteaseCrypt {
         None
     }
 
+    /// Returns a reference to the loaded/fused lyrics, if any.
+    pub fn lyrics(&self) -> Option<&str> {
+        self.lyrics.as_deref()
+    }
+
+    /// Sets the lyrics explicitly.
+    pub fn set_lyrics(&mut self, lrc: String) {
+        self.lyrics = Some(lrc);
+    }
+
+    /// Searches candidate directories for a matching .lrc file.
+    /// Looks for `<stem>.lrc`, `track-{musicId}.lrc`, `{musicId}.lrc` in `<dir>` and `<dir>/meta`.
+    /// When found, parses and fuses any JSON-formatted metadata/lines into standard LRC timestamps.
+    pub fn try_resolve_lyrics(&mut self, search_dirs: &[PathBuf]) -> Option<PathBuf> {
+        let stem = self.filepath.file_stem().and_then(|s| s.to_str())?;
+        let mut candidate_names = vec![format!("{stem}.lrc")];
+
+        if let Some(ref meta) = self.metadata {
+            if let Some(mid) = meta.music_id {
+                candidate_names.push(format!("track-{mid}.lrc"));
+                candidate_names.push(format!("{mid}.lrc"));
+            }
+        }
+
+        for dir in search_dirs {
+            for name in &candidate_names {
+                // Check <dir>/<name>
+                let p1 = dir.join(name);
+                if p1.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(&p1) {
+                        let fused = parse_and_fuse_lrc(&content);
+                        self.lyrics = Some(fused);
+                        return Some(p1);
+                    }
+                }
+                // Check <dir>/meta/<name>
+                let p2 = dir.join("meta").join(name);
+                if p2.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(&p2) {
+                        let fused = parse_and_fuse_lrc(&content);
+                        self.lyrics = Some(fused);
+                        return Some(p2);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn dump<P: AsRef<Path>>(
         &mut self,
         output_dir: Option<P>,
@@ -457,6 +508,13 @@ impl NeteaseCrypt {
                         data: self.image_data.clone(),
                     });
                 }
+                if let Some(ref lrc) = self.lyrics {
+                    tag.add_frame(id3::frame::Lyrics {
+                        lang: "XXX".to_string(),
+                        description: String::new(),
+                        text: lrc.clone(),
+                    });
+                }
                 tag.write_to_path(dump_path, id3::Version::Id3v24)?;
             }
             NcmFormat::Flac => {
@@ -474,9 +532,48 @@ impl NeteaseCrypt {
                         self.image_data.clone(),
                     );
                 }
+                if let Some(ref lrc) = self.lyrics {
+                    let comments = tag.vorbis_comments_mut();
+                    comments.set("LYRICS", vec![lrc.clone()]);
+                    comments.set("UNSYNCEDLYRICS", vec![lrc.clone()]);
+                }
                 tag.save()?;
             }
         }
         Ok(())
     }
+}
+
+/// Fuses NetEase hybrid JSON lines (`{"t": 0, "c": [{"tx": "..."}]}`) and standard LRC lines
+/// into unified standard LRC format `[mm:ss.xxx] text`.
+pub fn parse_and_fuse_lrc(content: &str) -> String {
+    let mut out_lines = Vec::new();
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim().trim_start_matches('\u{feff}');
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(t) = v.get("t").and_then(|t| t.as_i64()) {
+                    let mins = t / 60000;
+                    let secs = (t % 60000) / 1000;
+                    let ms = t % 1000;
+                    let mut text = String::new();
+                    if let Some(c) = v.get("c").and_then(|c| c.as_array()) {
+                        for item in c {
+                            if let Some(tx) = item.get("tx").and_then(|x| x.as_str()) {
+                                text.push_str(tx);
+                            }
+                        }
+                    }
+                    if text.is_empty() {
+                        out_lines.push(format!("[{mins:02}:{secs:02}.{ms:03}]"));
+                    } else {
+                        out_lines.push(format!("[{mins:02}:{secs:02}.{ms:03}] {text}"));
+                    }
+                    continue;
+                }
+            }
+        }
+        out_lines.push(raw_line.to_string());
+    }
+    out_lines.join("\n")
 }

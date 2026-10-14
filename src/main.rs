@@ -19,11 +19,12 @@ A fast, memory-safe standalone tool to convert NetEase Cloud Music (.ncm) files.
   -d, --directory <DIR>    Process files in a directory
   -r, --recursive          Process directory recursively (requires -d or dir argument)
   -o, --output <DIR>       Output directory (default: same as source file)
-  -m, --remove             Remove source .ncm file after successful conversion
+  -m, --remove             Remove source .ncm (and .lrc) files after successful conversion
   -i, --info               Inspect metadata without decrypting audio
   -j, --threads <NUM>      Number of parallel conversion threads (default: CPU cores)
       --meta <DIR>         Custom meta folder path containing track-<id>.jpg artwork
       --prefer-meta-cover  Prefer external meta/ cover over embedded .ncm cover
+      --no-lrc             Do not search for or embed .lrc lyrics
       --no-overwrite       Skip conversion if output file already exists
 
 \x1b[1mEXAMPLES:\x1b[0m
@@ -47,7 +48,7 @@ fn format_duration(ms: i64) -> String {
     format!("{mins}:{secs:02}")
 }
 
-fn get_cover_search_dirs(
+fn get_search_dirs(
     file_path: &Path,
     output_folder: Option<&Path>,
     custom_meta_dir: Option<&Path>,
@@ -70,8 +71,9 @@ fn get_cover_search_dirs(
 fn print_info(path: &Path, custom_meta: Option<&Path>) {
     match NeteaseCrypt::open(path) {
         Ok(mut crypt) => {
-            let search_dirs = get_cover_search_dirs(path, None, custom_meta);
+            let search_dirs = get_search_dirs(path, None, custom_meta);
             let resolved_cover = crypt.try_resolve_cover(&search_dirs, false);
+            let resolved_lrc = crypt.try_resolve_lyrics(&search_dirs);
 
             let meta = crypt.metadata();
             println!("\x1b[1;36m┌─────────────────────────────────────────────────────────────┐\x1b[0m");
@@ -135,6 +137,16 @@ fn print_info(path: &Path, custom_meta: Option<&Path>) {
                 "\x1b[1;36m│\x1b[0m \x1b[1mCover:\x1b[0m    {:<49} \x1b[1;36m│\x1b[0m",
                 cover_info
             );
+            let lrc_info = if let Some(ref p) = resolved_lrc {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                format!("Found & fused ({name})")
+            } else {
+                "None".to_string()
+            };
+            println!(
+                "\x1b[1;36m│\x1b[0m \x1b[1mLyrics:\x1b[0m   {:<49} \x1b[1;36m│\x1b[0m",
+                lrc_info
+            );
             println!("\x1b[1;36m└─────────────────────────────────────────────────────────────┘\x1b[0m");
         }
         Err(e) => {
@@ -153,6 +165,7 @@ fn process_file(
     remove: bool,
     no_overwrite: bool,
     prefer_meta_cover: bool,
+    no_lrc: bool,
     stats: &Stats,
     output_lock: &Mutex<()>,
 ) {
@@ -192,9 +205,13 @@ fn process_file(
 
     match NeteaseCrypt::open(file_path) {
         Ok(mut crypt) => {
-            // Check for album cover in candidate meta/ folders if missing or preferred
-            let search_dirs = get_cover_search_dirs(file_path, output_folder, custom_meta_dir);
+            let search_dirs = get_search_dirs(file_path, output_folder, custom_meta_dir);
             let resolved_cover = crypt.try_resolve_cover(&search_dirs, prefer_meta_cover);
+            let resolved_lrc = if !no_lrc {
+                crypt.try_resolve_lyrics(&search_dirs)
+            } else {
+                None
+            };
 
             let meta_summary = crypt
                 .metadata()
@@ -208,6 +225,13 @@ fn process_file(
                 String::new()
             };
 
+            let lrc_note = if let Some(ref p) = resolved_lrc {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("lrc");
+                format!(" \x1b[2;35m[lyrics: {name}]\x1b[0m")
+            } else {
+                String::new()
+            };
+
             match crypt.dump(output_folder) {
                 Ok(dump_path) => {
                     if let Err(e) = crypt.fix_metadata() {
@@ -217,25 +241,35 @@ fn process_file(
                             file_path.display()
                         );
                     }
-                    let removed_note = if remove {
+
+                    // Also export the clean, fused standard .lrc file alongside the dumped audio
+                    if let Some(lrc_text) = crypt.lyrics() {
+                        let out_lrc_path = dump_path.with_extension("lrc");
+                        let _ = std::fs::write(&out_lrc_path, lrc_text);
+                    }
+
+                    let mut removed_note = String::new();
+                    if remove {
                         match std::fs::remove_file(file_path) {
-                            Ok(_) => " \x1b[2m[source removed]\x1b[0m",
-                            Err(e) => {
-                                eprintln!(" \x1b[1;31m[failed to remove: {e}]\x1b[0m");
-                                ""
+                            Ok(_) => removed_note.push_str(" \x1b[2m[source removed]\x1b[0m"),
+                            Err(e) => removed_note.push_str(&format!(" \x1b[1;31m[failed to remove ncm: {e}]\x1b[0m")),
+                        }
+                        if let Some(ref src_lrc) = resolved_lrc {
+                            let out_lrc_path = dump_path.with_extension("lrc");
+                            if src_lrc != &out_lrc_path && src_lrc.exists() {
+                                let _ = std::fs::remove_file(src_lrc);
                             }
                         }
-                    } else {
-                        ""
-                    };
+                    }
 
                     let _g = output_lock.lock().unwrap();
                     println!(
-                        "\x1b[1;32m✔ DONE\x1b[0m  '{}' \x1b[2m->\x1b[0m '\x1b[36m{}\x1b[0m'{}{}{}",
+                        "\x1b[1;32m✔ DONE\x1b[0m  '{}' \x1b[2m->\x1b[0m '\x1b[36m{}\x1b[0m'{}{}{}{}",
                         file_path.display(),
                         dump_path.display(),
                         meta_summary,
                         cover_note,
+                        lrc_note,
                         removed_note
                     );
                     stats.succeeded.fetch_add(1, Ordering::Relaxed);
@@ -286,6 +320,7 @@ fn main() {
     let mut info_mode = false;
     let mut no_overwrite = false;
     let mut prefer_meta_cover = false;
+    let mut no_lrc = false;
     let mut custom_meta: Option<String> = None;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -311,6 +346,8 @@ fn main() {
             no_overwrite = true;
         } else if arg == "--prefer-meta-cover" {
             prefer_meta_cover = true;
+        } else if arg == "--no-lrc" {
+            no_lrc = true;
         } else if arg == "--meta" {
             i += 1;
             if i < args.len() {
@@ -508,6 +545,7 @@ fn main() {
                 remove,
                 no_overwrite,
                 prefer_meta_cover,
+                no_lrc,
                 &stats,
                 &output_lock,
             );
@@ -534,6 +572,7 @@ fn main() {
                         remove,
                         no_overwrite,
                         prefer_meta_cover,
+                        no_lrc,
                         stats_ref,
                         lock_ref,
                     );
