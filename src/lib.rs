@@ -80,6 +80,8 @@ pub struct NeteaseMusicMetadata {
     pub format: String,
     pub duration: i64,
     pub bitrate: i64,
+    pub music_id: Option<u64>,
+    pub album_id: Option<u64>,
 }
 
 fn parse_metadata(raw_json: &str) -> Option<NeteaseMusicMetadata> {
@@ -132,6 +134,13 @@ fn parse_metadata(raw_json: &str) -> Option<NeteaseMusicMetadata> {
         .unwrap_or_default()
         .to_string();
 
+    let music_id = v.get("musicId").and_then(|x| {
+        x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+    });
+    let album_id = v.get("albumId").and_then(|x| {
+        x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+    });
+
     Some(NeteaseMusicMetadata {
         name,
         album,
@@ -139,6 +148,8 @@ fn parse_metadata(raw_json: &str) -> Option<NeteaseMusicMetadata> {
         format,
         duration,
         bitrate,
+        music_id,
+        album_id,
     })
 }
 
@@ -290,6 +301,75 @@ impl NeteaseCrypt {
 
     pub fn image_mime(&self) -> &'static str {
         mime_type(&self.image_data)
+    }
+
+    /// Attempt to load a cover image from a specific directory (e.g. ~/meta or output/meta).
+    /// Looks for track-{musicId}.jpg/png, {musicId}.jpg/png, album-{albumId}.jpg/png.
+    pub fn load_cover_from_meta_dir(&mut self, meta_dir: &Path) -> Option<PathBuf> {
+        let meta = self.metadata.as_ref()?;
+        let mut candidate_filenames = Vec::new();
+
+        if let Some(mid) = meta.music_id {
+            candidate_filenames.push(format!("track-{mid}.jpg"));
+            candidate_filenames.push(format!("track-{mid}.jpeg"));
+            candidate_filenames.push(format!("track-{mid}.png"));
+            candidate_filenames.push(format!("track-{mid}"));
+            candidate_filenames.push(format!("{mid}.jpg"));
+            candidate_filenames.push(format!("{mid}.jpeg"));
+            candidate_filenames.push(format!("{mid}.png"));
+        }
+
+        if let Some(aid) = meta.album_id {
+            candidate_filenames.push(format!("album-{aid}.jpg"));
+            candidate_filenames.push(format!("album-{aid}.jpeg"));
+            candidate_filenames.push(format!("album-{aid}.png"));
+            candidate_filenames.push(format!("{aid}.jpg"));
+            candidate_filenames.push(format!("{aid}.jpeg"));
+            candidate_filenames.push(format!("{aid}.png"));
+        }
+
+        for name in candidate_filenames {
+            let candidate_path = meta_dir.join(&name);
+            if candidate_path.is_file() {
+                if let Ok(bytes) = std::fs::read(&candidate_path) {
+                    if !bytes.is_empty() {
+                        self.image_data = bytes;
+                        return Some(candidate_path);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Searches candidate directories for a matching cover image when the .ncm file
+    /// does not contain an embedded album image (or when force is true).
+    /// Checks both `<dir>/meta` and `<dir>` for each candidate search directory.
+    pub fn try_resolve_cover(
+        &mut self,
+        search_dirs: &[PathBuf],
+        force: bool,
+    ) -> Option<PathBuf> {
+        if !self.image_data.is_empty() && !force {
+            return None;
+        }
+
+        for dir in search_dirs {
+            // First check <dir>/meta
+            let meta_subdir = dir.join("meta");
+            if meta_subdir.is_dir() {
+                if let Some(found) = self.load_cover_from_meta_dir(&meta_subdir) {
+                    return Some(found);
+                }
+            }
+            // Also check <dir> directly
+            if dir.is_dir() {
+                if let Some(found) = self.load_cover_from_meta_dir(dir) {
+                    return Some(found);
+                }
+            }
+        }
+        None
     }
 
     pub fn dump<P: AsRef<Path>>(

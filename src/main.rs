@@ -22,6 +22,8 @@ A fast, memory-safe standalone tool to convert NetEase Cloud Music (.ncm) files.
   -m, --remove             Remove source .ncm file after successful conversion
   -i, --info               Inspect metadata without decrypting audio
   -j, --threads <NUM>      Number of parallel conversion threads (default: CPU cores)
+      --meta <DIR>         Custom meta folder path containing track-<id>.jpg artwork
+      --prefer-meta-cover  Prefer external meta/ cover over embedded .ncm cover
       --no-overwrite       Skip conversion if output file already exists
 
 \x1b[1mEXAMPLES:\x1b[0m
@@ -45,9 +47,32 @@ fn format_duration(ms: i64) -> String {
     format!("{mins}:{secs:02}")
 }
 
-fn print_info(path: &Path) {
+fn get_cover_search_dirs(
+    file_path: &Path,
+    output_folder: Option<&Path>,
+    custom_meta_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(meta) = custom_meta_dir {
+        dirs.push(meta.to_path_buf());
+    }
+    if let Some(out) = output_folder {
+        dirs.push(out.to_path_buf());
+    }
+    if let Some(parent) = file_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    dirs
+}
+
+fn print_info(path: &Path, custom_meta: Option<&Path>) {
     match NeteaseCrypt::open(path) {
-        Ok(crypt) => {
+        Ok(mut crypt) => {
+            let search_dirs = get_cover_search_dirs(path, None, custom_meta);
+            let resolved_cover = crypt.try_resolve_cover(&search_dirs, false);
+
             let meta = crypt.metadata();
             println!("\x1b[1;36m┌─────────────────────────────────────────────────────────────┐\x1b[0m");
             println!(
@@ -55,6 +80,12 @@ fn print_info(path: &Path) {
                 path.file_name().and_then(|n| n.to_str()).unwrap_or("")
             );
             if let Some(m) = meta {
+                if let Some(mid) = m.music_id {
+                    println!(
+                        "\x1b[1;36m│\x1b[0m \x1b[1mTrack ID:\x1b[0m {:<49} \x1b[1;36m│\x1b[0m",
+                        mid
+                    );
+                }
                 println!(
                     "\x1b[1;36m│\x1b[0m \x1b[1mTitle:\x1b[0m    {:<49} \x1b[1;36m│\x1b[0m",
                     m.name
@@ -92,11 +123,13 @@ fn print_info(path: &Path) {
                     );
                 }
             }
-            let img = crypt.image_data();
-            let cover_info = if !img.is_empty() {
-                format!("Embedded ({}, {:.1} KB)", crypt.image_mime(), img.len() as f64 / 1024.0)
+            let cover_info = if let Some(ref p) = resolved_cover {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                format!("From meta/{} ({}, {:.1} KB)", name, crypt.image_mime(), crypt.image_data().len() as f64 / 1024.0)
+            } else if !crypt.image_data().is_empty() {
+                format!("Embedded ({}, {:.1} KB)", crypt.image_mime(), crypt.image_data().len() as f64 / 1024.0)
             } else {
-                "None".to_string()
+                "None (missing in .ncm and meta/)".to_string()
             };
             println!(
                 "\x1b[1;36m│\x1b[0m \x1b[1mCover:\x1b[0m    {:<49} \x1b[1;36m│\x1b[0m",
@@ -116,8 +149,10 @@ fn print_info(path: &Path) {
 fn process_file(
     file_path: &Path,
     output_folder: Option<&Path>,
+    custom_meta_dir: Option<&Path>,
     remove: bool,
     no_overwrite: bool,
+    prefer_meta_cover: bool,
     stats: &Stats,
     output_lock: &Mutex<()>,
 ) {
@@ -157,10 +192,21 @@ fn process_file(
 
     match NeteaseCrypt::open(file_path) {
         Ok(mut crypt) => {
+            // Check for album cover in candidate meta/ folders if missing or preferred
+            let search_dirs = get_cover_search_dirs(file_path, output_folder, custom_meta_dir);
+            let resolved_cover = crypt.try_resolve_cover(&search_dirs, prefer_meta_cover);
+
             let meta_summary = crypt
                 .metadata()
                 .map(|m| format!(" ({} - {})", m.name, m.artist))
                 .unwrap_or_default();
+
+            let cover_note = if let Some(ref p) = resolved_cover {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("meta");
+                format!(" \x1b[2;36m[cover: {name}]\x1b[0m")
+            } else {
+                String::new()
+            };
 
             match crypt.dump(output_folder) {
                 Ok(dump_path) => {
@@ -185,10 +231,11 @@ fn process_file(
 
                     let _g = output_lock.lock().unwrap();
                     println!(
-                        "\x1b[1;32m✔ DONE\x1b[0m  '{}' \x1b[2m->\x1b[0m '\x1b[36m{}\x1b[0m'{}{}",
+                        "\x1b[1;32m✔ DONE\x1b[0m  '{}' \x1b[2m->\x1b[0m '\x1b[36m{}\x1b[0m'{}{}{}",
                         file_path.display(),
                         dump_path.display(),
                         meta_summary,
+                        cover_note,
                         removed_note
                     );
                     stats.succeeded.fetch_add(1, Ordering::Relaxed);
@@ -238,6 +285,8 @@ fn main() {
     let mut remove = false;
     let mut info_mode = false;
     let mut no_overwrite = false;
+    let mut prefer_meta_cover = false;
+    let mut custom_meta: Option<String> = None;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -260,6 +309,15 @@ fn main() {
             info_mode = true;
         } else if arg == "--no-overwrite" {
             no_overwrite = true;
+        } else if arg == "--prefer-meta-cover" {
+            prefer_meta_cover = true;
+        } else if arg == "--meta" {
+            i += 1;
+            if i < args.len() {
+                custom_meta = Some(args[i].clone());
+            }
+        } else if arg.starts_with("--meta=") {
+            custom_meta = Some(arg["--meta=".len()..].to_string());
         } else if arg == "-j" || arg == "--threads" {
             i += 1;
             if i < args.len() {
@@ -304,6 +362,8 @@ fn main() {
         process::exit(0);
     }
 
+    let meta_path = custom_meta.as_deref().map(Path::new);
+
     // Info mode
     if info_mode {
         if filenames.is_empty() && directory.is_none() {
@@ -311,7 +371,7 @@ fn main() {
             process::exit(1);
         }
         for f in &filenames {
-            print_info(Path::new(f));
+            print_info(Path::new(f), meta_path);
         }
         return;
     }
@@ -444,8 +504,10 @@ fn main() {
             process_file(
                 file_path,
                 out_folder.as_deref(),
+                meta_path,
                 remove,
                 no_overwrite,
+                prefer_meta_cover,
                 &stats,
                 &output_lock,
             );
@@ -468,8 +530,10 @@ fn main() {
                     process_file(
                         file_path,
                         out_folder.as_deref(),
+                        meta_path,
                         remove,
                         no_overwrite,
+                        prefer_meta_cover,
                         stats_ref,
                         lock_ref,
                     );

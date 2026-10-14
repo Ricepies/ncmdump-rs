@@ -66,3 +66,31 @@ fn test_mp3_metadata_tagging() {
 
     let _ = std::fs::remove_file(temp_mp3);
 }
+
+#[test]
+fn test_meta_folder_cover_resolution() {
+    let test_ncm = Path::new("/home/ricepies/fun/ncmdump/test/test.ncm");
+    let mut crypt = NeteaseCrypt::open(test_ncm).expect("Failed to open test.ncm");
+
+    let meta = crypt.metadata().expect("Metadata should exist");
+    assert_eq!(meta.music_id, Some(1318234987));
+    assert_eq!(meta.album_id, Some(73914415));
+
+    // Create a temporary meta folder with track-1318234987.jpg
+    let temp_root = std::env::temp_dir().join("ncmdump_meta_test");
+    let meta_dir = temp_root.join("meta");
+    let _ = std::fs::create_dir_all(&meta_dir);
+
+    let test_jpg = meta_dir.join("track-1318234987.jpg");
+    let fake_jpg_bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46]; // JPEG header
+    std::fs::write(&test_jpg, &fake_jpg_bytes).expect("Write test jpg");
+
+    // Clear existing image to simulate a file with no embedded cover
+    let resolved = crypt.try_resolve_cover(&[temp_root.clone()], true);
+    assert!(resolved.is_some());
+    assert_eq!(resolved.unwrap(), test_jpg);
+    assert_eq!(crypt.image_data(), fake_jpg_bytes.as_slice());
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
