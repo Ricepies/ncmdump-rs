@@ -1,4 +1,5 @@
 /target
+/dist
 *.lrc
 *.flac
 *.mp3
