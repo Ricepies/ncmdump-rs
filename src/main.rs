@@ -1,7 +1,9 @@
 use ncmdump::{
-    inspect_flac, inspect_mp3, mime_type, resolve_cover_image, resolve_lyrics_file,
-    update_flac_tags, update_mp3_tags, NcmFormat, NeteaseCrypt,
+    inspect_flac, inspect_mp3, mime_type, resolve_cover_for_audio,
+    resolve_lyrics_for_audio, update_flac_tags, update_mp3_tags,
+    NcmFormat, NeteaseCrypt,
 };
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,6 +28,10 @@ A fast, memory-safe standalone tool to convert NetEase Cloud Music (.ncm) files.
   -m, --remove             Remove source .ncm (and .lrc) files after successful conversion
   -i, --info               Inspect metadata without decrypting audio
   -j, --threads <NUM>      Number of parallel conversion threads (default: CPU cores)
+      --debug              Output detailed file mappings and resolution traces
+  -q, --quiet              Quiet mode (only output errors)
+      --no-online          Disable auto-fallback online search
+      --fetch-cover        Download cover from NetEase CDN if missing in meta/
       --meta <DIR>         Custom meta folder path containing track-<id>.jpg artwork
       --prefer-meta-cover  Prefer external meta/ cover over embedded .ncm cover
       --no-lrc             Do not search for, embed, or save .lrc lyrics
@@ -34,15 +40,158 @@ A fast, memory-safe standalone tool to convert NetEase Cloud Music (.ncm) files.
 \x1b[1mEXAMPLES:\x1b[0m
   ncmdump song.ncm
   ncmdump song1.ncm song2.ncm -o ./Music
-  ncmdump -d ./Music -r -o ./Decrypted
+  ncmdump -d ./Music -r -a -o ./Processed
+  ncmdump -d ./Music --debug
   ncmdump -i song.ncm
 ";
 
-#[derive(Default)]
-struct Stats {
+struct UI {
+    total: usize,
+    completed: AtomicUsize,
     succeeded: AtomicUsize,
     skipped: AtomicUsize,
     failed: AtomicUsize,
+    anomalies: AtomicUsize,
+    start_time: Instant,
+    is_tty: bool,
+    debug: bool,
+    quiet: bool,
+    stdout_lock: Mutex<()>,
+}
+
+impl UI {
+    fn new(total: usize, debug: bool, quiet: bool) -> Self {
+        use std::io::IsTerminal;
+        let is_tty = std::io::stderr().is_terminal() && !quiet;
+        Self {
+            total,
+            completed: AtomicUsize::new(0),
+            succeeded: AtomicUsize::new(0),
+            skipped: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+            anomalies: AtomicUsize::new(0),
+            start_time: Instant::now(),
+            is_tty,
+            debug,
+            quiet,
+            stdout_lock: Mutex::new(()),
+        }
+    }
+
+    fn draw_bar(&self) {
+        if !self.is_tty {
+            return;
+        }
+        let done = self.completed.load(Ordering::Relaxed);
+        let total = self.total;
+        let pct = if total > 0 { (done * 100) / total } else { 100 };
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.05 { done as f64 / elapsed } else { 0.0 };
+        let eta_secs = if speed > 0.1 && done < total {
+            ((total - done) as f64 / speed) as u64
+        } else {
+            0
+        };
+        let eta_str = format!("{:02}:{:02}", eta_secs / 60, eta_secs % 60);
+
+        let bar_width = 20;
+        let filled = (pct * bar_width) / 100;
+        let empty = bar_width.saturating_sub(filled);
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+
+        eprint!(
+            "\r\x1b[2K\x1b[1;36m[\x1b[1;32m{bar}\x1b[0;1;36m]\x1b[0m \x1b[1m{done}/{total}\x1b[0m ({pct}%) • \x1b[33m{speed:.1} files/s\x1b[0m [ETA {eta_str}]"
+        );
+        let _ = std::io::stderr().flush();
+    }
+
+    fn tick(&self) {
+        let _g = self.stdout_lock.lock().unwrap();
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.draw_bar();
+    }
+
+    fn log_warn(&self, msg: &str) {
+        self.anomalies.fetch_add(1, Ordering::Relaxed);
+        if self.quiet {
+            return;
+        }
+        let _g = self.stdout_lock.lock().unwrap();
+        if self.is_tty {
+            eprint!("\r\x1b[2K");
+            eprintln!("\x1b[1;33m⚠ WARN\x1b[0m  {msg}");
+            self.draw_bar();
+        } else {
+            eprintln!("\x1b[1;33m⚠ WARN\x1b[0m  {msg}");
+        }
+    }
+
+    fn log_fail(&self, msg: &str) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        let _g = self.stdout_lock.lock().unwrap();
+        if self.is_tty {
+            eprint!("\r\x1b[2K");
+            eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  {msg}");
+            self.draw_bar();
+        } else {
+            eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  {msg}");
+        }
+    }
+
+    fn log_skip(&self, msg: &str) {
+        self.skipped.fetch_add(1, Ordering::Relaxed);
+        if !self.debug {
+            return;
+        }
+        let _g = self.stdout_lock.lock().unwrap();
+        if self.is_tty {
+            eprint!("\r\x1b[2K");
+            println!("\x1b[1;33m⚡ SKIP\x1b[0m  {msg}");
+            self.draw_bar();
+        } else {
+            println!("\x1b[1;33m⚡ SKIP\x1b[0m  {msg}");
+        }
+    }
+
+    fn log_done(&self, msg: &str) {
+        self.succeeded.fetch_add(1, Ordering::Relaxed);
+        if !self.debug {
+            return;
+        }
+        let _g = self.stdout_lock.lock().unwrap();
+        if self.is_tty {
+            eprint!("\r\x1b[2K");
+            println!("\x1b[1;32m✔ DONE\x1b[0m  {msg}");
+            self.draw_bar();
+        } else {
+            println!("\x1b[1;32m✔ DONE\x1b[0m  {msg}");
+        }
+    }
+
+    fn finish(&self) {
+        let _g = self.stdout_lock.lock().unwrap();
+        if self.is_tty {
+            eprint!("\r\x1b[2K");
+        }
+        if self.quiet {
+            return;
+        }
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let succ = self.succeeded.load(Ordering::Relaxed);
+        let skip = self.skipped.load(Ordering::Relaxed);
+        let fail = self.failed.load(Ordering::Relaxed);
+        let anom = self.anomalies.load(Ordering::Relaxed);
+        let total_processed = succ + skip + fail;
+        let speed = if elapsed > 0.0 {
+            total_processed as f64 / elapsed
+        } else {
+            0.0
+        };
+        println!(
+            "\x1b[1;32m✔ Complete\x1b[0m in {:.2}s ({:.1} files/s). Succeeded: {}, Skipped: {}, Failed: {}, Anomalies: {}.",
+            elapsed, speed, succ, skip, fail, anom
+        );
+    }
 }
 
 fn format_duration(ms: i64) -> String {
@@ -101,8 +250,8 @@ fn print_info(path: &Path, custom_meta: Option<&Path>) {
             Ok(meta) => {
                 let search_dirs = get_search_dirs(path, None, custom_meta);
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                let resolved_cover = resolve_cover_image(&search_dirs, stem, meta.music_id, meta.album_id);
-                let resolved_lrc = resolve_lyrics_file(&search_dirs, stem, meta.music_id);
+                let resolved_cover = resolve_cover_for_audio(&search_dirs, stem, &meta, false, false);
+                let resolved_lrc = resolve_lyrics_for_audio(&search_dirs, stem, &meta, false);
 
                 println!("\x1b[1;36m┌─────────────────────────────────────────────────────────────┐\x1b[0m");
                 println!(
@@ -143,25 +292,25 @@ fn print_info(path: &Path, custom_meta: Option<&Path>) {
                         format!("{} kbps", meta.bitrate / 1000)
                     );
                 }
-                let cover_info = if let Some((ref p, ref d)) = resolved_cover {
+                let cover_info = if let Some((ref p, ref d, ref reason)) = resolved_cover {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    format!("Found in meta/{} ({}, {:.1} KB)", name, mime_type(d), d.len() as f64 / 1024.0)
+                    format!("Found in meta/{} ({reason}, {:.1} KB)", name, d.len() as f64 / 1024.0)
                 } else if meta.has_cover {
                     "Embedded front cover".to_string()
                 } else {
-                    "None (no embedded cover or meta image)".to_string()
+                    "None (missing cover)".to_string()
                 };
                 println!(
                     "\x1b[1;36m│\x1b[0m \x1b[1mCover:\x1b[0m    {:<49} \x1b[1;36m│\x1b[0m",
                     cover_info
                 );
-                let lrc_info = if let Some((ref p, _)) = resolved_lrc {
+                let lrc_info = if let Some((ref p, _, ref reason)) = resolved_lrc {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    format!("Found & fused ({name})")
+                    format!("Found ({name}, {reason})")
                 } else if meta.has_lyrics {
                     "Embedded lyrics".to_string()
                 } else {
-                    "None".to_string()
+                    "None (missing lyrics)".to_string()
                 };
                 println!(
                     "\x1b[1;36m│\x1b[0m \x1b[1mLyrics:\x1b[0m   {:<49} \x1b[1;36m│\x1b[0m",
@@ -234,9 +383,18 @@ fn print_info(path: &Path, custom_meta: Option<&Path>) {
             }
             let cover_info = if let Some(ref p) = resolved_cover {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                format!("From meta/{} ({}, {:.1} KB)", name, crypt.image_mime(), crypt.image_data().len() as f64 / 1024.0)
+                format!(
+                    "From meta/{} ({}, {:.1} KB)",
+                    name,
+                    crypt.image_mime(),
+                    crypt.image_data().len() as f64 / 1024.0
+                )
             } else if !crypt.image_data().is_empty() {
-                format!("Embedded ({}, {:.1} KB)", crypt.image_mime(), crypt.image_data().len() as f64 / 1024.0)
+                format!(
+                    "Embedded ({}, {:.1} KB)",
+                    crypt.image_mime(),
+                    crypt.image_data().len() as f64 / 1024.0
+                )
             } else {
                 "None (missing in .ncm and meta/)".to_string()
             };
@@ -257,10 +415,7 @@ fn print_info(path: &Path, custom_meta: Option<&Path>) {
             println!("\x1b[1;36m└─────────────────────────────────────────────────────────────┘\x1b[0m");
         }
         Err(e) => {
-            eprintln!(
-                "\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}",
-                path.display()
-            );
+            eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}", path.display());
         }
     }
 }
@@ -273,39 +428,36 @@ fn process_file(
     no_overwrite: bool,
     prefer_meta_cover: bool,
     no_lrc: bool,
-    stats: &Stats,
-    output_lock: &Mutex<()>,
+    _auto_fallback: bool,
+    _fetch_cover: bool,
+    ui: &UI,
 ) {
     if !file_path.exists() {
-        let _g = output_lock.lock().unwrap();
-        eprintln!(
-            "\x1b[1;31m✖ FAIL\x1b[0m  File '{}' does not exist.",
-            file_path.display()
-        );
-        stats.failed.fetch_add(1, Ordering::Relaxed);
+        ui.log_fail(&format!("File '{}' does not exist.", file_path.display()));
+        ui.tick();
         return;
     }
 
     if file_path.extension().and_then(|s| s.to_str()) != Some("ncm") {
+        ui.tick();
         return;
     }
 
-    // Check potential output path to skip if no-overwrite is requested
     if no_overwrite {
         let file_name = match file_path.file_name() {
             Some(n) => n,
-            None => return,
+            None => {
+                ui.tick();
+                return;
+            }
         };
-        let target_dir = output_folder.unwrap_or_else(|| file_path.parent().unwrap_or(Path::new("")));
+        let target_dir =
+            output_folder.unwrap_or_else(|| file_path.parent().unwrap_or(Path::new("")));
         let potential_mp3 = target_dir.join(file_name).with_extension("mp3");
         let potential_flac = target_dir.join(file_name).with_extension("flac");
         if potential_mp3.exists() || potential_flac.exists() {
-            let _g = output_lock.lock().unwrap();
-            println!(
-                "\x1b[1;33m⚡ SKIP\x1b[0m  '{}' (already exists)",
-                file_path.display()
-            );
-            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            ui.log_skip(&format!("'{}' (already exists)", file_path.display()));
+            ui.tick();
             return;
         }
     }
@@ -319,6 +471,17 @@ fn process_file(
             } else {
                 None
             };
+
+            let has_cover = !crypt.image_data().is_empty() || resolved_cover.is_some();
+            if !has_cover {
+                ui.log_warn(&format!(
+                    "'{}' missing album cover in meta/",
+                    file_path.display()
+                ));
+            }
+            if !no_lrc && resolved_lrc.is_none() {
+                ui.log_warn(&format!("'{}' missing lyrics", file_path.display()));
+            }
 
             let meta_summary = crypt
                 .metadata()
@@ -343,19 +506,13 @@ fn process_file(
 
             match crypt.dump(output_folder) {
                 Ok(dump_path) => {
-                    if let Err(e) = crypt.fix_metadata() {
-                        let _g = output_lock.lock().unwrap();
-                        eprintln!(
-                            "\x1b[1;33m⚠ WARN\x1b[0m  Failed to fix metadata for '{}': {e}",
-                            file_path.display()
-                        );
-                    }
-
+                    let _ = crypt.fix_metadata();
                     let mut removed_note = String::new();
                     if remove {
                         match std::fs::remove_file(file_path) {
                             Ok(_) => removed_note.push_str(" \x1b[2m[source removed]\x1b[0m"),
-                            Err(e) => removed_note.push_str(&format!(" \x1b[1;31m[failed to remove ncm: {e}]\x1b[0m")),
+                            Err(e) => removed_note
+                                .push_str(&format!(" \x1b[1;31m[failed to remove ncm: {e}]\x1b[0m")),
                         }
                         if let Some(ref src_lrc) = resolved_lrc {
                             if src_lrc.exists() {
@@ -364,9 +521,8 @@ fn process_file(
                         }
                     }
 
-                    let _g = output_lock.lock().unwrap();
-                    println!(
-                        "\x1b[1;32m✔ DONE\x1b[0m  '{}' \x1b[2m->\x1b[0m '\x1b[36m{}\x1b[0m'{}{}{}{}",
+                    let done_msg = format!(
+                        "'{}' \x1b[2m->\x1b[0m '\x1b[36m{}\x1b[0m'{}{}{}{}",
                         file_path.display(),
                         dump_path.display(),
                         meta_summary,
@@ -374,25 +530,18 @@ fn process_file(
                         lrc_note,
                         removed_note
                     );
-                    stats.succeeded.fetch_add(1, Ordering::Relaxed);
+                    ui.log_done(&done_msg);
+                    ui.tick();
                 }
                 Err(e) => {
-                    let _g = output_lock.lock().unwrap();
-                    eprintln!(
-                        "\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}",
-                        file_path.display()
-                    );
-                    stats.failed.fetch_add(1, Ordering::Relaxed);
+                    ui.log_fail(&format!("'{}': {e}", file_path.display()));
+                    ui.tick();
                 }
             }
         }
         Err(e) => {
-            let _g = output_lock.lock().unwrap();
-            eprintln!(
-                "\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}",
-                file_path.display()
-            );
-            stats.failed.fetch_add(1, Ordering::Relaxed);
+            ui.log_fail(&format!("'{}': {e}", file_path.display()));
+            ui.tick();
         }
     }
 }
@@ -405,22 +554,22 @@ fn process_audio_file(
     no_overwrite: bool,
     prefer_meta_cover: bool,
     no_lrc: bool,
-    stats: &Stats,
-    output_lock: &Mutex<()>,
+    auto_fallback: bool,
+    fetch_cover: bool,
+    ui: &UI,
 ) {
     if !file_path.exists() {
-        let _g = output_lock.lock().unwrap();
-        eprintln!(
-            "\x1b[1;31m✖ FAIL\x1b[0m  File '{}' does not exist.",
-            file_path.display()
-        );
-        stats.failed.fetch_add(1, Ordering::Relaxed);
+        ui.log_fail(&format!("File '{}' does not exist.", file_path.display()));
+        ui.tick();
         return;
     }
 
     let file_name = match file_path.file_name() {
         Some(n) => n,
-        None => return,
+        None => {
+            ui.tick();
+            return;
+        }
     };
     let is_inplace = output_folder.is_none() || output_folder == file_path.parent();
     let target_path = if let Some(out_dir) = output_folder {
@@ -430,12 +579,8 @@ fn process_audio_file(
     };
 
     if no_overwrite && !is_inplace && target_path.exists() {
-        let _g = output_lock.lock().unwrap();
-        println!(
-            "\x1b[1;33m⚡ SKIP\x1b[0m  '{}' (already exists)",
-            file_path.display()
-        );
-        stats.skipped.fetch_add(1, Ordering::Relaxed);
+        ui.log_skip(&format!("'{}' (already exists)", file_path.display()));
+        ui.tick();
         return;
     }
 
@@ -443,18 +588,16 @@ fn process_audio_file(
         if let Some(parent) = target_path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    let _g = output_lock.lock().unwrap();
-                    eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}", file_path.display());
-                    stats.failed.fetch_add(1, Ordering::Relaxed);
+                    ui.log_fail(&format!("'{}': {e}", file_path.display()));
+                    ui.tick();
                     return;
                 }
             }
         }
         if target_path != file_path {
             if let Err(e) = std::fs::copy(file_path, &target_path) {
-                let _g = output_lock.lock().unwrap();
-                eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}", file_path.display());
-                stats.failed.fetch_add(1, Ordering::Relaxed);
+                ui.log_fail(&format!("'{}': {e}", file_path.display()));
+                ui.tick();
                 return;
             }
         }
@@ -468,6 +611,7 @@ fn process_audio_file(
     let is_flac = ext == "flac";
     let is_mp3 = ext == "mp3";
     if !is_flac && !is_mp3 {
+        ui.tick();
         return;
     }
 
@@ -480,9 +624,8 @@ fn process_audio_file(
     let audio_meta = match audio_meta {
         Ok(m) => m,
         Err(e) => {
-            let _g = output_lock.lock().unwrap();
-            eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  '{}': {e}", file_path.display());
-            stats.failed.fetch_add(1, Ordering::Relaxed);
+            ui.log_fail(&format!("'{}': {e}", file_path.display()));
+            ui.tick();
             return;
         }
     };
@@ -491,19 +634,34 @@ fn process_audio_file(
     let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
     let resolved_cover = if !audio_meta.has_cover || prefer_meta_cover {
-        resolve_cover_image(&search_dirs, stem, audio_meta.music_id, audio_meta.album_id)
+        resolve_cover_for_audio(&search_dirs, stem, &audio_meta, auto_fallback, fetch_cover)
     } else {
         None
     };
 
     let resolved_lrc = if !no_lrc {
-        resolve_lyrics_file(&search_dirs, stem, audio_meta.music_id)
+        resolve_lyrics_for_audio(&search_dirs, stem, &audio_meta, auto_fallback)
     } else {
         None
     };
 
-    let cover_arg = resolved_cover.as_ref().map(|(_, d)| (d.as_slice(), mime_type(d)));
-    let lrc_arg = resolved_lrc.as_ref().map(|(_, s)| s.as_str());
+    let has_cover = audio_meta.has_cover || resolved_cover.is_some();
+    if !has_cover {
+        ui.log_warn(&format!(
+            "'{}' missing album cover in meta/",
+            file_path.display()
+        ));
+    }
+
+    let has_lyrics = audio_meta.has_lyrics || resolved_lrc.is_some();
+    if !no_lrc && !has_lyrics {
+        ui.log_warn(&format!("'{}' missing lyrics", file_path.display()));
+    }
+
+    let cover_arg = resolved_cover
+        .as_ref()
+        .map(|(_, d, _)| (d.as_slice(), mime_type(d)));
+    let lrc_arg = resolved_lrc.as_ref().map(|(_, s, _)| s.as_str());
 
     let tag_res = if is_flac {
         update_flac_tags(
@@ -524,12 +682,11 @@ fn process_audio_file(
     };
 
     if let Err(e) = tag_res {
-        let _g = output_lock.lock().unwrap();
-        eprintln!(
-            "\x1b[1;31m✖ FAIL\x1b[0m  Failed to update tags for '{}': {e}",
+        ui.log_fail(&format!(
+            "Failed to update tags for '{}': {e}",
             file_path.display()
-        );
-        stats.failed.fetch_add(1, Ordering::Relaxed);
+        ));
+        ui.tick();
         return;
     }
 
@@ -538,10 +695,11 @@ fn process_audio_file(
         if !is_inplace {
             match std::fs::remove_file(file_path) {
                 Ok(_) => removed_note.push_str(" \x1b[2m[source removed]\x1b[0m"),
-                Err(e) => removed_note.push_str(&format!(" \x1b[1;31m[failed to remove audio: {e}]\x1b[0m")),
+                Err(e) => removed_note
+                    .push_str(&format!(" \x1b[1;31m[failed to remove audio: {e}]\x1b[0m")),
             }
         }
-        if let Some((ref src_lrc, _)) = resolved_lrc {
+        if let Some((ref src_lrc, _, _)) = resolved_lrc {
             if src_lrc.exists() {
                 let _ = std::fs::remove_file(src_lrc);
             }
@@ -554,49 +712,53 @@ fn process_audio_file(
         _ => String::new(),
     };
 
-    let cover_note = if let Some((ref p, _)) = resolved_cover {
+    let cover_note = if let Some((ref p, _, ref reason)) = resolved_cover {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("meta");
-        format!(" \x1b[2;36m[cover: {name}]\x1b[0m")
+        format!(" \x1b[2;36m[cover: {name} ({reason})]\x1b[0m")
     } else if audio_meta.has_cover {
         " \x1b[2;36m[cover: embedded]\x1b[0m".to_string()
     } else {
         " \x1b[2;33m[no cover]\x1b[0m".to_string()
     };
 
-    let lrc_note = if let Some((ref p, _)) = resolved_lrc {
+    let lrc_note = if let Some((ref p, _, ref reason)) = resolved_lrc {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("lrc");
-        format!(" \x1b[2;35m[lyrics: {name}]\x1b[0m")
+        format!(" \x1b[2;35m[lyrics: {name} ({reason})]\x1b[0m")
     } else if audio_meta.has_lyrics {
         " \x1b[2;35m[lyrics: embedded]\x1b[0m".to_string()
     } else {
         String::new()
     };
 
-    let _g = output_lock.lock().unwrap();
-    if is_inplace {
-        println!(
-            "\x1b[1;32m✔ DONE\x1b[0m  '{}'{}{}{}{}",
+    let done_msg = if is_inplace {
+        format!(
+            "'{}'{}{}{}{}",
             file_path.display(),
             meta_summary,
             cover_note,
             lrc_note,
             removed_note
-        );
+        )
     } else {
-        println!(
-            "\x1b[1;32m✔ DONE\x1b[0m  '{}' \x1b[2m->\x1b[0m '\x1b[36m{}\x1b[0m'{}{}{}{}",
+        format!(
+            "'{}' \x1b[2m->\x1b[0m '\x1b[36m{}\x1b[0m'{}{}{}{}",
             file_path.display(),
             target_path.display(),
             meta_summary,
             cover_note,
             lrc_note,
             removed_note
-        );
-    }
-    stats.succeeded.fetch_add(1, Ordering::Relaxed);
+        )
+    };
+    ui.log_done(&done_msg);
+    ui.tick();
 }
 
-fn walk_dir_recursive(dir: &Path, files: &mut Vec<PathBuf>, all_audio: bool) -> std::io::Result<()> {
+fn walk_dir_recursive(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    all_audio: bool,
+) -> std::io::Result<()> {
     if dir.is_dir() {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
@@ -632,6 +794,10 @@ fn main() {
     let mut prefer_meta_cover = false;
     let mut no_lrc = false;
     let mut _save_lrc = false;
+    let mut debug_mode = false;
+    let mut quiet_mode = false;
+    let mut auto_fallback = true;
+    let mut fetch_cover = false;
     let mut custom_meta: Option<String> = None;
     let mut threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -655,6 +821,14 @@ fn main() {
             all_audio = true;
         } else if arg == "-i" || arg == "--info" {
             info_mode = true;
+        } else if arg == "--debug" || arg == "--verbose" {
+            debug_mode = true;
+        } else if arg == "-q" || arg == "--quiet" {
+            quiet_mode = true;
+        } else if arg == "--no-online" {
+            auto_fallback = false;
+        } else if arg == "--fetch-cover" {
+            fetch_cover = true;
         } else if arg == "--no-overwrite" {
             no_overwrite = true;
         } else if arg == "--prefer-meta-cover" {
@@ -695,87 +869,56 @@ fn main() {
             output = Some(args[i].clone());
         } else if arg.starts_with("--output=") {
             output = Some(arg["--output=".len()..].to_string());
-        } else if arg.starts_with('-') {
+        } else if !arg.starts_with('-') {
+            filenames.push(arg.clone());
+        } else {
+            eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  Unknown option '{arg}'.");
             println!("{}", HELP_MESSAGE);
             process::exit(1);
-        } else {
-            filenames.push(arg.clone());
         }
         i += 1;
     }
 
     if help {
         println!("{}", HELP_MESSAGE);
-        process::exit(0);
+        return;
     }
 
     if version {
-        println!("ncmdump version {VERSION}");
-        process::exit(0);
+        println!("ncmdump v{}", VERSION);
+        return;
     }
 
     let meta_path = custom_meta.as_deref().map(Path::new);
 
-    // Info mode
     if info_mode {
-        if filenames.is_empty() && directory.is_none() {
-            println!("{}", HELP_MESSAGE);
+        if filenames.is_empty() {
+            if let Some(ref dir) = directory {
+                let p = Path::new(dir);
+                if p.is_file() {
+                    print_info(p, meta_path);
+                    return;
+                }
+            }
+            eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  Please specify a file to inspect with -i.");
             process::exit(1);
         }
-        for f in &filenames {
-            print_info(Path::new(f), meta_path);
+        for file in &filenames {
+            print_info(Path::new(file), meta_path);
         }
         return;
     }
 
-    // Auto-detect if positional arguments contain directories
-    if directory.is_none() && filenames.len() == 1 {
-        let p = Path::new(&filenames[0]);
-        if p.is_dir() {
-            directory = Some(filenames[0].clone());
-            filenames.clear();
-        }
-    }
-
-    if recursive && directory.is_none() {
-        eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  -r option requires a directory (-d option or directory path).");
-        process::exit(1);
-    }
-
-    if directory.is_none() && filenames.is_empty() {
-        println!("{}", HELP_MESSAGE);
-        process::exit(1);
-    }
-
     let output_dir_specified = output.is_some();
-    let mut output_dir = PathBuf::new();
-    if let Some(ref out) = output {
-        output_dir = PathBuf::from(out);
-        if output_dir.exists() && !output_dir.is_dir() {
-            eprintln!(
-                "\x1b[1;31m✖ FAIL\x1b[0m  '{}' is not a valid directory.",
-                output_dir.display()
-            );
-            process::exit(1);
-        }
-        if let Err(e) = std::fs::create_dir_all(&output_dir) {
-            eprintln!("\x1b[1;31m✖ FAIL\x1b[0m  Failed to create output directory: {e}");
-            process::exit(1);
-        }
-    }
+    let output_dir = output.map(PathBuf::from);
 
-    let start_time = Instant::now();
-    let stats = Stats::default();
-    let output_lock = Mutex::new(());
-
-    // Collect list of files to process: (source_path, target_folder)
     let mut task_list: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
 
-    if let Some(ref dir) = directory {
-        let source_dir = PathBuf::from(dir);
-        if !source_dir.is_dir() {
+    if let Some(dir_str) = directory {
+        let source_dir = PathBuf::from(dir_str);
+        if !source_dir.exists() {
             eprintln!(
-                "\x1b[1;31m✖ FAIL\x1b[0m  '{}' is not a valid directory.",
+                "\x1b[1;31m✖ FAIL\x1b[0m  Directory '{}' does not exist.",
                 source_dir.display()
             );
             process::exit(1);
@@ -789,7 +932,7 @@ fn main() {
             }
 
             let target_base = if output_dir_specified {
-                output_dir.clone()
+                output_dir.clone().unwrap_or_else(|| source_dir.clone())
             } else {
                 source_dir.clone()
             };
@@ -813,10 +956,11 @@ fn main() {
                                 .and_then(|s| s.to_str())
                                 .map(|s| s.to_ascii_lowercase());
                             let is_ncm = ext.as_deref() == Some("ncm");
-                            let is_audio = ext.as_deref() == Some("flac") || ext.as_deref() == Some("mp3");
+                            let is_audio =
+                                ext.as_deref() == Some("flac") || ext.as_deref() == Some("mp3");
                             if is_ncm || (all_audio && is_audio) {
                                 let out_folder = if output_dir_specified {
-                                    Some(output_dir.clone())
+                                    output_dir.clone()
                                 } else {
                                     None
                                 };
@@ -839,7 +983,6 @@ fn main() {
                     "\x1b[1;31m✖ FAIL\x1b[0m  '{}' is not a valid file.",
                     path.display()
                 );
-                stats.failed.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let ext = path
@@ -850,7 +993,7 @@ fn main() {
             let is_audio = ext.as_deref() == Some("flac") || ext.as_deref() == Some("mp3");
             if is_ncm || (all_audio && is_audio) {
                 let out_folder = if output_dir_specified {
-                    Some(output_dir.clone())
+                    output_dir.clone()
                 } else {
                     None
                 };
@@ -860,11 +1003,10 @@ fn main() {
     }
 
     if task_list.is_empty() {
-        if stats.failed.load(Ordering::Relaxed) > 0 {
-            process::exit(1);
-        }
         return;
     }
+
+    let ui = UI::new(task_list.len(), debug_mode, quiet_mode);
 
     let run_task = |file_path: &Path, out_folder: Option<&Path>| {
         let ext = file_path
@@ -881,8 +1023,9 @@ fn main() {
                 no_overwrite,
                 prefer_meta_cover,
                 no_lrc,
-                &stats,
-                &output_lock,
+                auto_fallback,
+                fetch_cover,
+                &ui,
             );
         } else if ext == "flac" || ext == "mp3" {
             process_audio_file(
@@ -893,19 +1036,21 @@ fn main() {
                 no_overwrite,
                 prefer_meta_cover,
                 no_lrc,
-                &stats,
-                &output_lock,
+                auto_fallback,
+                fetch_cover,
+                &ui,
             );
         }
     };
 
-    // Execute tasks in parallel or sequential based on task count
+    // Draw initial bar
+    ui.draw_bar();
+
     if task_list.len() <= 1 || threads <= 1 {
         for (file_path, out_folder) in &task_list {
             run_task(file_path, out_folder.as_deref());
         }
     } else {
-        use std::sync::atomic::AtomicUsize;
         let index = AtomicUsize::new(0);
         let task_ref = &task_list;
 
@@ -923,16 +1068,9 @@ fn main() {
         });
     }
 
-    // Print summary if more than 1 file was processed
-    if task_list.len() > 1 {
-        let elapsed = start_time.elapsed();
-        let succ = stats.succeeded.load(Ordering::Relaxed);
-        let skip = stats.skipped.load(Ordering::Relaxed);
-        let fail = stats.failed.load(Ordering::Relaxed);
-        println!("\x1b[2m─────────────────────────────────────────────────────────────\x1b[0m");
-        println!(
-            "\x1b[1;32m✨ Complete:\x1b[0m {} processed, {} skipped, {} failed in {:.2?}",
-            succ, skip, fail, elapsed
-        );
+    ui.finish();
+
+    if ui.failed.load(Ordering::Relaxed) > 0 {
+        process::exit(1);
     }
 }

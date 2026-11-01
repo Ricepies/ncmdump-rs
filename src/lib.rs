@@ -2,6 +2,7 @@ use aes::Aes128;
 use base64::prelude::*;
 use cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
 use id3::TagLike;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -673,6 +674,586 @@ pub fn resolve_lyrics_file(
             }
         }
     }
+    None
+}
+
+fn url_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 3);
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            out.push(b as char);
+        } else if b == b' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut cur = body;
+    while !cur.is_empty() {
+        if let Some(pos) = cur.windows(2).position(|w| w == b"\r\n") {
+            let len_str = match std::str::from_utf8(&cur[..pos]) {
+                Ok(s) => s.trim(),
+                Err(_) => break,
+            };
+            let chunk_len = match usize::from_str_radix(len_str, 16) {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if chunk_len == 0 {
+                break;
+            }
+            let chunk_start = pos + 2;
+            if chunk_start + chunk_len > cur.len() {
+                break;
+            }
+            out.extend_from_slice(&cur[chunk_start..chunk_start + chunk_len]);
+            let next = chunk_start + chunk_len + 2;
+            if next >= cur.len() {
+                break;
+            }
+            cur = &cur[next..];
+        } else {
+            break;
+        }
+    }
+    if out.is_empty() {
+        body.to_vec()
+    } else {
+        out
+    }
+}
+
+pub fn http_get_simple(
+    host: &str,
+    port: u16,
+    path_and_query: &str,
+    timeout_secs: u64,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // 1. Try standard library TcpStream
+    let addr = format!("{host}:{port}");
+    if let Ok(stream) = std::net::TcpStream::connect(&addr) {
+        let timeout = Some(std::time::Duration::from_secs(timeout_secs));
+        let _ = stream.set_read_timeout(timeout);
+        let _ = stream.set_write_timeout(timeout);
+        let mut stream = stream;
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: curl/7.88.1\r\nConnection: close\r\nAccept: */*\r\n\r\n",
+            path_and_query, host
+        );
+        if stream.write_all(request.as_bytes()).is_ok() {
+            let mut response = Vec::new();
+            if stream.read_to_end(&mut response).is_ok() && !response.is_empty() {
+                if let Some(pos) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header_bytes = &response[..pos];
+                    let body = &response[pos + 4..];
+                    if let Ok(header_str) = std::str::from_utf8(header_bytes) {
+                        let is_200 = header_str.starts_with("HTTP/1.1 200") || header_str.starts_with("HTTP/1.0 200");
+                        if is_200 {
+                            let is_chunked = header_str.to_ascii_lowercase().contains("transfer-encoding: chunked");
+                            if is_chunked {
+                                return Ok(dechunk(body));
+                            } else {
+                                return Ok(body.to_vec());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to curl CLI
+    let url = if port == 80 {
+        format!("http://{host}{path_and_query}")
+    } else {
+        format!("http://{host}:{port}{path_and_query}")
+    };
+    let output = std::process::Command::new("curl")
+        .arg("-s")
+        .arg("-m")
+        .arg(timeout_secs.to_string())
+        .arg(&url)
+        .output();
+    if let Ok(out) = output {
+        if out.status.success() && !out.stdout.is_empty() {
+            return Ok(out.stdout);
+        }
+    }
+
+    Err("HTTP request failed".into())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NeteaseSearchResult {
+    pub music_id: u64,
+    pub album_id: Option<u64>,
+    pub pic_id: Option<u64>,
+    pub pic_url: Option<String>,
+    pub title: String,
+    pub artist: String,
+}
+
+pub fn query_netease_search_api(
+    title: &str,
+    artist: &str,
+    duration_ms: i64,
+) -> Option<NeteaseSearchResult> {
+    let query = if !artist.is_empty() {
+        format!("{artist} {title}")
+    } else {
+        title.to_string()
+    };
+    let path = format!("/api/search/get/web?s={}&type=1&limit=5", url_encode(&query));
+    let bytes = http_get_simple("music.163.com", 80, &path, 3).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let songs = json.get("result")?.get("songs")?.as_array()?;
+    if songs.is_empty() {
+        return None;
+    }
+
+    let mut best_match = None;
+    let mut best_score = 0;
+
+    for song in songs {
+        let song_id = song.get("id")?.as_u64()?;
+        let song_name = song.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let song_duration = song.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+
+        let mut score = 10;
+        if !title.is_empty() && (song_name.contains(title) || title.contains(song_name)) {
+            score += 50;
+        }
+        if duration_ms > 0 && song_duration > 0 {
+            let diff = (duration_ms - song_duration).abs();
+            if diff < 3000 {
+                score += 40;
+            } else if diff < 6000 {
+                score += 20;
+            }
+        }
+
+        if score > best_score {
+            best_score = score;
+            let album = song.get("album");
+            let album_id = album.and_then(|a| a.get("id")).and_then(|v| v.as_u64());
+            let pic_id = album.and_then(|a| a.get("picId")).and_then(|v| v.as_u64());
+            let pic_url = album.and_then(|a| a.get("picUrl")).and_then(|v| v.as_str()).map(|s| s.to_string());
+            let artist_name = song
+                .get("artists")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            best_match = Some(NeteaseSearchResult {
+                music_id: song_id,
+                album_id,
+                pic_id,
+                pic_url,
+                title: song_name.to_string(),
+                artist: artist_name,
+            });
+        }
+    }
+
+    best_match
+}
+
+pub fn download_cover_from_url(url: &str, timeout_secs: u64) -> Option<Vec<u8>> {
+    if let Some(stripped) = url.strip_prefix("http://") {
+        if let Some(slash_pos) = stripped.find('/') {
+            let host = &stripped[..slash_pos];
+            let path = &stripped[slash_pos..];
+            if let Ok(bytes) = http_get_simple(host, 80, path, timeout_secs) {
+                if !bytes.is_empty() {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+
+    // Fallback using curl
+    let output = std::process::Command::new("curl")
+        .arg("-s")
+        .arg("-m")
+        .arg(timeout_secs.to_string())
+        .arg(url)
+        .output();
+    if let Ok(out) = output {
+        if out.status.success() && !out.stdout.is_empty() {
+            return Some(out.stdout);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+pub struct MetaLrcEntry {
+    pub music_id: u64,
+    pub path: PathBuf,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+}
+
+pub fn scan_meta_lrcs(search_dirs: &[PathBuf]) -> Vec<MetaLrcEntry> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for dir in search_dirs {
+        for candidate_dir in &[dir.join("meta"), dir.clone()] {
+            if !candidate_dir.is_dir() {
+                continue;
+            }
+            if let Ok(rd) = std::fs::read_dir(candidate_dir) {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase());
+                    if ext.as_deref() != Some("lrc") {
+                        continue;
+                    }
+                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let mid_opt = if let Some(stripped) = stem.strip_prefix("track-") {
+                        stripped.parse::<u64>().ok()
+                    } else {
+                        stem.parse::<u64>().ok()
+                    };
+
+                    let mid = match mid_opt {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    if !seen.insert(mid) {
+                        continue;
+                    }
+
+                    if let Ok(mut file) = File::open(&path) {
+                        let mut buf = vec![0u8; 4096];
+                        let n = file.read(&mut buf).unwrap_or(0);
+                        buf.truncate(n);
+                        let text = String::from_utf8_lossy(&buf);
+
+                        let mut title = None;
+                        let mut artist = None;
+
+                        for line in text.lines() {
+                            let trimmed = line.trim();
+                            if let Some(pos) = trimmed.find("[ti:") {
+                                if let Some(end) = trimmed[pos + 4..].find(']') {
+                                    title = Some(trimmed[pos + 4..pos + 4 + end].trim().to_string());
+                                }
+                            }
+                            if let Some(pos) = trimmed.find("[ar:") {
+                                if let Some(end) = trimmed[pos + 4..].find(']') {
+                                    artist = Some(trimmed[pos + 4..pos + 4 + end].trim().to_string());
+                                }
+                            }
+                        }
+
+                        entries.push(MetaLrcEntry {
+                            music_id: mid,
+                            path,
+                            title,
+                            artist,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    entries
+}
+
+pub fn resolve_cover_for_audio(
+    search_dirs: &[PathBuf],
+    stem: &str,
+    audio_meta: &AudioMetadata,
+    auto_fallback: bool,
+    fetch_cover: bool,
+) -> Option<(PathBuf, Vec<u8>, String)> {
+    // 1. First, check direct IDs if known (e.g. from 163 key or filename)
+    if let Some((path, data)) = resolve_cover_image(search_dirs, stem, audio_meta.music_id, audio_meta.album_id) {
+        let reason = if audio_meta.music_id.is_some() {
+            "music ID match"
+        } else {
+            "stem/file match"
+        };
+        return Some((path, data, reason.to_string()));
+    }
+
+    // 2. Parse stem variations: strip duplicate suffix like " (1)"
+    let clean_stem = if let Some(idx) = stem.rfind(" (") {
+        if stem.ends_with(')') { &stem[..idx] } else { stem }
+    } else {
+        stem
+    };
+
+    let (title_parsed, artist_parsed) = if let Some(pos) = clean_stem.find(" - ") {
+        (&clean_stem[pos + 3..], &clean_stem[..pos])
+    } else {
+        (clean_stem, "")
+    };
+
+    let title = audio_meta.title.as_deref().unwrap_or(title_parsed).trim();
+    let artist = audio_meta.artist.as_deref().unwrap_or(artist_parsed).trim();
+
+    // Check title / artist permutations
+    if !title.is_empty() {
+        let mut name_variants = Vec::new();
+        if !artist.is_empty() {
+            name_variants.push(format!("{artist} - {title}.jpg"));
+            name_variants.push(format!("{artist} - {title}.jpeg"));
+            name_variants.push(format!("{artist} - {title}.png"));
+            name_variants.push(format!("{title} - {artist}.jpg"));
+            name_variants.push(format!("{title} - {artist}.jpeg"));
+            name_variants.push(format!("{title} - {artist}.png"));
+        }
+        name_variants.push(format!("{title}.jpg"));
+        name_variants.push(format!("{title}.jpeg"));
+        name_variants.push(format!("{title}.png"));
+
+        for dir in search_dirs {
+            for v in &name_variants {
+                for candidate in &[dir.join("meta").join(v), dir.join(v)] {
+                    if candidate.is_file() {
+                        if let Ok(bytes) = std::fs::read(candidate) {
+                            if !bytes.is_empty() {
+                                return Some((candidate.clone(), bytes, "title/artist name match".to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Inspect sidecar .lrc for NetEase ID or CDN image hash
+    let mut sidecar_lrc_candidates = Vec::new();
+    sidecar_lrc_candidates.push(format!("{stem}.lrc"));
+    if clean_stem != stem {
+        sidecar_lrc_candidates.push(format!("{clean_stem}.lrc"));
+    }
+    if !title.is_empty() && !artist.is_empty() {
+        sidecar_lrc_candidates.push(format!("{artist} - {title}.lrc"));
+        sidecar_lrc_candidates.push(format!("{title} - {artist}.lrc"));
+    }
+
+    for dir in search_dirs {
+        for name in &sidecar_lrc_candidates {
+            for lrc_path in &[dir.join(name), dir.join("meta").join(name)] {
+                if lrc_path.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(lrc_path) {
+                        let mut extracted_id: Option<u64> = None;
+                        if let Some(pos) = content.find("orpheus://nm/song?id=") {
+                            let start = pos + "orpheus://nm/song?id=".len();
+                            let num_str: String = content[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                            if let Ok(id) = num_str.parse::<u64>() {
+                                extracted_id = Some(id);
+                            }
+                        }
+                        if extracted_id.is_none() {
+                            if let Some(pos) = content.find("[id:") {
+                                let start = pos + 4;
+                                let num_str: String = content[start..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                                if let Ok(id) = num_str.parse::<u64>() {
+                                    extracted_id = Some(id);
+                                }
+                            }
+                        }
+                        if let Some(id) = extracted_id {
+                            if let Some((p, d)) = resolve_cover_image(search_dirs, "", Some(id), None) {
+                                return Some((p, d, format!("sidecar .lrc ID match (id: {id})")));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Inverted meta/*.lrc index matching
+    if !title.is_empty() {
+        let meta_lrcs = scan_meta_lrcs(search_dirs);
+        for entry in meta_lrcs {
+            let mut matched = false;
+            if let Some(ref entry_title) = entry.title {
+                if entry_title.eq_ignore_ascii_case(title) || entry_title.contains(title) || title.contains(entry_title) {
+                    matched = true;
+                }
+            }
+            if !matched {
+                if let Ok(content) = std::fs::read_to_string(&entry.path) {
+                    if content.contains(title) {
+                        matched = true;
+                    }
+                }
+            }
+
+            if matched {
+                let id = entry.music_id;
+                if let Some((p, d)) = resolve_cover_image(search_dirs, "", Some(id), None) {
+                    return Some((p, d, format!("meta/track-{id}.lrc match")));
+                }
+            }
+        }
+    }
+
+    // 5. Auto Fallback: NetEase search API
+    if auto_fallback && !title.is_empty() {
+        if let Some(res) = query_netease_search_api(title, artist, audio_meta.duration) {
+            let mut candidate_ids = Vec::new();
+            candidate_ids.push(format!("track-{}", res.music_id));
+            candidate_ids.push(format!("{}", res.music_id));
+            if let Some(aid) = res.album_id {
+                candidate_ids.push(format!("album-{aid}"));
+                candidate_ids.push(format!("{aid}"));
+            }
+            if let Some(pid) = res.pic_id {
+                candidate_ids.push(format!("track-{pid}"));
+                candidate_ids.push(format!("{pid}"));
+            }
+
+            for dir in search_dirs {
+                for id_name in &candidate_ids {
+                    for ext in &["jpg", "jpeg", "png", ""] {
+                        let fname = if ext.is_empty() {
+                            id_name.clone()
+                        } else {
+                            format!("{id_name}.{ext}")
+                        };
+                        for cand in &[dir.join("meta").join(&fname), dir.join(&fname)] {
+                            if cand.is_file() {
+                                if let Ok(bytes) = std::fs::read(cand) {
+                                    if !bytes.is_empty() {
+                                        return Some((cand.clone(), bytes, format!("NetEase API search -> meta/ match (id: {})", res.music_id)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if fetch_cover {
+                if let Some(ref pic_url) = res.pic_url {
+                    if let Some(bytes) = download_cover_from_url(pic_url, 5) {
+                        let save_dir = search_dirs.first().map(|d| d.join("meta")).unwrap_or_else(|| PathBuf::from("meta"));
+                        let save_path = save_dir.join(format!("track-{}.jpg", res.music_id));
+                        let _ = std::fs::create_dir_all(&save_dir);
+                        let _ = std::fs::write(&save_path, &bytes);
+                        return Some((save_path, bytes, "downloaded from NetEase CDN".to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Generic covers
+    for dir in search_dirs {
+        for generic in &["cover.jpg", "cover.png", "folder.jpg", "front.jpg"] {
+            for cand in &[dir.join("meta").join(generic), dir.join(generic)] {
+                if cand.is_file() {
+                    if let Ok(bytes) = std::fs::read(cand) {
+                        if !bytes.is_empty() {
+                            return Some((cand.clone(), bytes, "generic cover match".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn resolve_lyrics_for_audio(
+    search_dirs: &[PathBuf],
+    stem: &str,
+    audio_meta: &AudioMetadata,
+    auto_fallback: bool,
+) -> Option<(PathBuf, String, String)> {
+    // 1. Direct stem or ID
+    if let Some((path, fused)) = resolve_lyrics_file(search_dirs, stem, audio_meta.music_id) {
+        return Some((path, fused, "stem or music ID match".to_string()));
+    }
+
+    let clean_stem = if let Some(idx) = stem.rfind(" (") {
+        if stem.ends_with(')') { &stem[..idx] } else { stem }
+    } else {
+        stem
+    };
+
+    let (title_parsed, artist_parsed) = if let Some(pos) = clean_stem.find(" - ") {
+        (&clean_stem[pos + 3..], &clean_stem[..pos])
+    } else {
+        (clean_stem, "")
+    };
+
+    let title = audio_meta.title.as_deref().unwrap_or(title_parsed).trim();
+    let artist = audio_meta.artist.as_deref().unwrap_or(artist_parsed).trim();
+
+    // 2. Inverted meta/*.lrc index matching
+    if !title.is_empty() {
+        let meta_lrcs = scan_meta_lrcs(search_dirs);
+        for entry in meta_lrcs {
+            let mut matched = false;
+            if let Some(ref entry_title) = entry.title {
+                if entry_title.eq_ignore_ascii_case(title) || entry_title.contains(title) || title.contains(entry_title) {
+                    matched = true;
+                }
+            }
+            if !matched {
+                if let Ok(content) = std::fs::read_to_string(&entry.path) {
+                    if content.contains(title) {
+                        matched = true;
+                    }
+                }
+            }
+
+            if matched {
+                if let Ok(content) = std::fs::read_to_string(&entry.path) {
+                    let fused = parse_and_fuse_lrc(&content);
+                    return Some((entry.path, fused, format!("meta/track-{}.lrc match", entry.music_id)));
+                }
+            }
+        }
+    }
+
+    // 3. Auto fallback: NetEase search API
+    if auto_fallback && !title.is_empty() {
+        if let Some(res) = query_netease_search_api(title, artist, audio_meta.duration) {
+            let lrc_names = [format!("track-{}.lrc", res.music_id), format!("{}.lrc", res.music_id)];
+            for dir in search_dirs {
+                for name in &lrc_names {
+                    for cand in &[dir.join("meta").join(name), dir.join(name)] {
+                        if cand.is_file() {
+                            if let Ok(content) = std::fs::read_to_string(cand) {
+                                let fused = parse_and_fuse_lrc(&content);
+                                return Some((cand.clone(), fused, format!("NetEase API search -> meta/ match (id: {})", res.music_id)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     None
 }
 

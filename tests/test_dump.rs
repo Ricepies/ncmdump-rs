@@ -329,6 +329,127 @@ fn test_cli_all_audio_flac_recursive() {
     let _ = std::fs::remove_dir_all(&temp_root);
 }
 
+#[test]
+fn test_audio_cover_matching_via_inverted_meta_lrc() {
+    let temp_root = std::env::temp_dir().join("ncmdump_inverted_lrc_test");
+    let src_dir = temp_root.join("src");
+    let meta_dir = src_dir.join("meta");
+    let out_dir = temp_root.join("out");
+    let _ = std::fs::create_dir_all(&meta_dir);
+    let _ = std::fs::create_dir_all(&out_dir);
+
+    // Audio file with NO music ID in filename or tags: "黄诗扶 - 楚歌起.mp3"
+    let mp3_path = src_dir.join("黄诗扶 - 楚歌起.mp3");
+    std::fs::write(&mp3_path, b"ID3\x04\x00\x00\x00\x00\x00\x00dummy audio content").unwrap();
+
+    let mut tag = id3::Tag::new();
+    tag.set_title("楚歌起");
+    tag.set_artist("黄诗扶");
+    tag.write_to_path(&mp3_path, id3::Version::Id3v24).unwrap();
+
+    // In meta/, put track-1998354733.lrc with [ti:楚歌起] and track-1998354733.jpg
+    let lrc_path = meta_dir.join("track-1998354733.lrc");
+    std::fs::write(&lrc_path, "[ti:楚歌起]\n[ar:黄诗扶]\n[00:05.00] 楚歌起歌词").unwrap();
+
+    let jpg_path = meta_dir.join("track-1998354733.jpg");
+    let fake_jpg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+    std::fs::write(&jpg_path, &fake_jpg).unwrap();
+
+    // Run ncmdump with -a and --debug
+    let bin_path = env!("CARGO_BIN_EXE_ncmdump");
+    let output = std::process::Command::new(bin_path)
+        .arg("-a")
+        .arg("-d")
+        .arg(&src_dir)
+        .arg("-o")
+        .arg(&out_dir)
+        .arg("--debug")
+        .output()
+        .expect("Run ncmdump with -a --debug");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("STDOUT:\n{stdout}");
+    println!("STDERR:\n{stderr}");
+    assert!(output.status.success());
+
+    // In --debug mode, DONE mapping must be present
+    assert!(stdout.contains("DONE"));
+    assert!(stdout.contains("track-1998354733.jpg"));
+
+    // Check output file
+    let dest_mp3 = out_dir.join("黄诗扶 - 楚歌起.mp3");
+    assert!(dest_mp3.exists());
+
+    let dest_tag = id3::Tag::read_from_path(&dest_mp3).expect("Read dest tag");
+    assert_eq!(dest_tag.pictures().count(), 1);
+    let lyrics = dest_tag.lyrics().next().expect("Lyrics fused");
+    assert!(lyrics.text.contains("楚歌起歌词"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_ui_anomalies_and_quiet_mode() {
+    let temp_root = std::env::temp_dir().join("ncmdump_ui_test");
+    let src_dir = temp_root.join("src");
+    let meta_dir = src_dir.join("meta");
+    let _ = std::fs::create_dir_all(&meta_dir);
+
+    // Audio file with missing cover and missing lyrics
+    let mp3_path = src_dir.join("Unknown_Song.mp3");
+    std::fs::write(&mp3_path, b"ID3\x04\x00\x00\x00\x00\x00\x00dummy audio content").unwrap();
+
+    let mut tag = id3::Tag::new();
+    tag.set_title("Unknown Title XYZ 9999");
+    tag.write_to_path(&mp3_path, id3::Version::Id3v24).unwrap();
+
+    let bin_path = env!("CARGO_BIN_EXE_ncmdump");
+
+    // 1. In default mode without --debug: anomalies (WARN) must be logged
+    let output = std::process::Command::new(bin_path)
+        .arg("-a")
+        .arg(&mp3_path)
+        .arg("--no-online")
+        .output()
+        .expect("Run ncmdump default");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stderr.contains("WARN") || stdout.contains("WARN"));
+    assert!(stderr.contains("missing album cover") || stdout.contains("missing album cover"));
+    assert!(stderr.contains("missing lyrics") || stdout.contains("missing lyrics"));
+    // Default mode should NOT print DONE
+    assert!(!stdout.contains("✔ DONE"));
+
+    // 2. In quiet mode -q: warnings must be suppressed
+    let output_quiet = std::process::Command::new(bin_path)
+        .arg("-a")
+        .arg("-q")
+        .arg(&mp3_path)
+        .arg("--no-online")
+        .output()
+        .expect("Run ncmdump quiet");
+
+    let stderr_quiet = String::from_utf8_lossy(&output_quiet.stderr);
+    let stdout_quiet = String::from_utf8_lossy(&output_quiet.stdout);
+    assert!(!stderr_quiet.contains("WARN"));
+    assert!(!stdout_quiet.contains("WARN"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_netease_search_api_online_fallback() {
+    let res = ncmdump::query_netease_search_api("楚歌起", "黄诗扶", 0);
+    if let Some(song) = res {
+        assert!(song.music_id > 0);
+        assert!(song.album_id.is_some());
+        assert!(song.pic_id.is_some());
+        println!("Resolved online: ID={}, Title={}, Artist={}", song.music_id, song.title, song.artist);
+    }
+}
+
 
 
 

@@ -86,6 +86,10 @@ OPTIONS:
   -m, --remove             Remove source .ncm (and .lrc) files after successful conversion
   -i, --info               Inspect metadata without decrypting audio
   -j, --threads <NUM>      Number of parallel conversion threads (default: CPU cores)
+      --debug              Output detailed file mappings and resolution traces
+  -q, --quiet              Quiet mode (only output errors)
+      --no-online          Disable auto-fallback online search
+      --fetch-cover        Download cover from NetEase CDN if missing in meta/
       --meta <DIR>         Custom meta folder path containing track-<id>.jpg artwork
       --prefer-meta-cover  Prefer external meta/ cover over embedded .ncm cover
       --no-lrc             Do not search for, embed, or save .lrc lyrics
